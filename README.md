@@ -1,3 +1,24 @@
+# Go2 Mjlab Princeton
+The repo is forked from Unitree's RL Mjlab. 
+
+## Installation
+Follow the official installation steps below to install.
+
+## Nature's parkour
+The parkour demo is added in as an additional task you can use to train Go2 with vision.
+
+Training:
+```bash
+python scripts/train.py Unitree-Go2-Parkour --env.scene.num-envs=256
+```
+Tested on RTX4070 12GB. Takes 4 hours for 15,000 iterations.
+
+Replay:
+```bash
+python3 scripts/play.py Unitree-Go2-Parkour --checkpoint-file=<path_to_model.pt>
+```
+
+---
 # Unitree RL Mjlab
 
 
