@@ -15,7 +15,6 @@ from mjlab.managers.action_manager import ActionTermCfg
 from mjlab.managers.command_manager import CommandTermCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
-from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -43,9 +42,10 @@ def make_parkour_env_cfg() -> ManagerBasedRlEnvCfg:
     name="front_depth",
     parent_body="",  # Set per-robot (e.g., "robot/base_link").
     pos=(0.342, 0.0, 0.03),  # Just past front collision geom (base2 ends ~0.335m).
-    # Camera looks forward: MuJoCo camera convention is -Z forward.
-    # Rotate so camera -Z → world +X (forward), camera +Y → world +Z (up).
-    quat=(0.5, 0.5, -0.5, -0.5),  # w, x, y, z
+    # Camera looks forward and ~20° downward so the robot can see the ground
+    # 0.5–1.5 m ahead (critical for gap detection). Base orientation rotated
+    # from (0.5, 0.5, -0.5, -0.5) by an additional 20° pitch-down.
+    quat=(0.406, 0.579, -0.579, -0.406),  # w, x, y, z — 20° downward tilt
     fovy=87.0,  # Wide FOV for obstacle detection.
     width=64,
     height=64,
@@ -103,7 +103,7 @@ def make_parkour_env_cfg() -> ManagerBasedRlEnvCfg:
     "height_scan": ObservationTermCfg(
       func=envs_mdp.height_scan,
       params={"sensor_name": "terrain_scan"},
-      noise=Unoise(n_min=-0.1, n_max=0.1),
+      noise=Unoise(n_min=-0.03, n_max=0.03),  # Reduced noise to preserve gap signal.
       scale=1 / terrain_scan.max_distance,
     ),
   }
@@ -151,7 +151,7 @@ def make_parkour_env_cfg() -> ManagerBasedRlEnvCfg:
       terms=proprio_terms,
       concatenate_terms=True,
       enable_corruption=True,
-      history_length=1,
+      history_length=5,  # Temporal context for gap approach planning.
     ),
     "depth": ObservationGroupCfg(
       terms=depth_terms,
@@ -162,7 +162,7 @@ def make_parkour_env_cfg() -> ManagerBasedRlEnvCfg:
       terms=critic_terms,
       concatenate_terms=True,
       enable_corruption=False,
-      history_length=1,
+      history_length=5,  # Match actor history for consistent temporal context.
     ),
   }
 
@@ -194,7 +194,7 @@ def make_parkour_env_cfg() -> ManagerBasedRlEnvCfg:
       heading_command=False,
       debug_vis=True,
       ranges=UniformVelocityCommandCfg.Ranges(
-        lin_vel_x=(0.5, 1.5),  # Always forward.
+        lin_vel_x=(0.3, 1.5),  # Allow slower approach for gap negotiation.
         lin_vel_y=(-0.1, 0.1),  # Minimal lateral.
         ang_vel_z=(-0.2, 0.2),  # Minimal yaw.
       ),
@@ -291,13 +291,14 @@ def make_parkour_env_cfg() -> ManagerBasedRlEnvCfg:
     # Forward progress bonus (parkour-specific).
     "forward_progress": RewardTermCfg(
       func=mdp.forward_progress,
-      weight=2.0,
+      weight=1.0,  # Reduced from 2.0 — less rush, more room for cautious gap approach.
     ),
 
-    # Gait pattern: trot with 0.5s period (CRITICAL for learning to walk).
+    # Gait pattern: trot with 0.5s period. Reduced weight to allow the robot
+    # to break gait when needed for strategic foot placement at gaps.
     "feet_gait": RewardTermCfg(
       func=mdp.feet_gait,
-      weight=0.5,
+      weight=0.25,  # Reduced from 0.5 — advisory, not mandatory.
       params={
         "period": 0.5,
         "offset": [0.0, 0.5, 0.5, 0.0],  # Set per-robot (trot pattern).
@@ -326,7 +327,7 @@ def make_parkour_env_cfg() -> ManagerBasedRlEnvCfg:
     ),
     "body_height": RewardTermCfg(
       func=mdp.body_height_penalty,
-      weight=-1.0,
+      weight=-0.5,  # Reduced from -1.0 — allow body to dip when bridging gaps.
       params={"target_height": 0.30},
     ),
     "body_ang_vel": RewardTermCfg(
@@ -342,12 +343,13 @@ def make_parkour_env_cfg() -> ManagerBasedRlEnvCfg:
       params={"sensor_name": "nonfoot_ground_touch", "force_threshold": 10.0},
     ),
 
-    # Foot rewards.
+    # Foot rewards. One-sided clearance: only penalizes feet dragging below
+    # target, not high stepping (needed for gap crossing).
     "feet_clearance": RewardTermCfg(
       func=mdp.feet_clearance,
-      weight=-0.5,
+      weight=-0.25,  # Reduced from -0.5 — less restrictive for obstacle negotiation.
       params={
-        "target_height": 0.08,
+        "target_height": 0.06,  # Reduced from 0.08 — only penalize actual dragging.
         "asset_cfg": SceneEntityCfg("robot", site_names=()),  # Set per-robot.
       },
     ),
@@ -374,8 +376,36 @@ def make_parkour_env_cfg() -> ManagerBasedRlEnvCfg:
       weight=-1e-5,
     ),
 
+    # Gap crossing — dense: forward progress while a gap is detected.
+    # drop_threshold=0.7: Go2 at 0.30m → flat terrain drop ~0.30m (< 0.7, no gap),
+    # rough terrain drop ~0.42m (< 0.7, no gap), real gap drop ~2.3m (> 0.7, gap).
+    # min_gap_rays=2 requires at least 2 scan rays to report a drop, eliminating
+    # single-ray noise from rough terrain.
+    "gap_crossing": RewardTermCfg(
+      func=mdp.gap_crossing_reward,
+      weight=5.0,
+      params={
+        "scan_sensor_name": "terrain_scan",
+        "drop_threshold": 0.7,
+        "min_gap_rays": 1,
+      },
+    ),
+
+    # Gap crossing — sparse: one-time bonus when the robot clears a gap forward.
+    # Only fires if the robot moved past its gap-entry x position, ruling out
+    # turn-arounds or backing away.
+    "gap_crossing_bonus": RewardTermCfg(
+      func=mdp.gap_crossing_bonus,
+      weight=10.0,
+      params={
+        "scan_sensor_name": "terrain_scan",
+        "drop_threshold": 0.7,
+        "min_gap_rays": 1,
+      },
+    ),
+
     # Termination penalty.
-    "is_terminated": RewardTermCfg(func=mdp.is_terminated, weight=-200.0),
+    "is_terminated": RewardTermCfg(func=mdp.is_terminated, weight=-50.0),
   }
 
   ##
@@ -390,7 +420,7 @@ def make_parkour_env_cfg() -> ManagerBasedRlEnvCfg:
     ),
     "base_too_low": TerminationTermCfg(
       func=mdp.base_too_low,
-      params={"min_height": 0.10},
+      params={"min_height": 0.05},  # Lowered from 0.10 — allow body dip during gap bridging.
     ),
   }
 
@@ -445,5 +475,5 @@ def make_parkour_env_cfg() -> ManagerBasedRlEnvCfg:
       ),
     ),
     decimation=4,
-    episode_length_s=20.0,
+    episode_length_s=35.0,
   )

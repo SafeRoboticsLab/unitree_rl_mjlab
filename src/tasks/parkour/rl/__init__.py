@@ -1,1 +1,2 @@
 from .runner import ParkourOnPolicyRunner as ParkourOnPolicyRunner
+from .safety_runner import ParkourSafetyOnPolicyRunner as ParkourSafetyOnPolicyRunner

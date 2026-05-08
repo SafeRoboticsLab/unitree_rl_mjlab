@@ -33,9 +33,9 @@ class GapJumpTerrainCfg(SubTerrainCfg):
   Gap width scales with difficulty.
   """
 
-  gap_width_range: tuple[float, float] = (0.1, 0.6)
+  gap_width_range: tuple[float, float] = (0.01, 0.6)
   """Min/max gap width in meters, interpolated by difficulty."""
-  gap_depth: float = 2.0
+  gap_depth: float = 1.5
   """Depth of the gap (how far down it goes)."""
   num_gaps: int = 3
   """Number of gaps along the track."""

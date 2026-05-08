@@ -153,12 +153,32 @@ def launch_training(task_id: str, args: TrainConfig | None = None):
     log_dir_name += f"_{args.agent.run_name}"
   log_dir = log_root_path / log_dir_name
 
+  # Normalize MIG / GPU UUIDs (Princeton Slurm) into integer indices before
+  # mjlab's select_gpus parses CUDA_VISIBLE_DEVICES as ints. Keep the original
+  # UUIDs around so we can map back after selection — overwriting with plain
+  # ints would break the Slurm cgroup restriction.
+  _orig_uuids: list[str] | None = None
+  _cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+  if _cvd:
+    _entries = [e.strip() for e in _cvd.split(",") if e.strip()]
+    if any(e.startswith(("MIG-", "GPU-")) for e in _entries):
+      _orig_uuids = _entries
+      os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(len(_entries)))
+      print(
+        f"[INFO] Remapped UUID CUDA_VISIBLE_DEVICES ({len(_entries)} device(s)) "
+        f"-> {os.environ['CUDA_VISIBLE_DEVICES']}",
+        flush=True,
+      )
+
   # Select GPUs based on CUDA_VISIBLE_DEVICES and user specification.
   selected_gpus, num_gpus = select_gpus(args.gpu_ids)
 
   # Set environment variables for all modes.
   if selected_gpus is None:
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+  elif _orig_uuids is not None:
+    # Map integer indices back to the original UUIDs so Slurm's MIG restriction holds.
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(_orig_uuids[i] for i in selected_gpus)
   else:
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, selected_gpus))
   os.environ["MUJOCO_GL"] = "egl"

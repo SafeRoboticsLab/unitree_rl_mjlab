@@ -1,8 +1,10 @@
-"""RL configuration for Unitree Go2 parkour task.
+"""RL configuration for the Go2 walking (shield nominal) policy.
 
-Uses CNNModel for the actor (processes depth images + proprioception)
-and MLPModel for the critic (privileged proprioceptive info only).
+MLP actor over proprioception only. Critic uses the privileged ``critic``
+group.
 """
+
+from __future__ import annotations
 
 from mjlab.rl import (
   RslRlModelCfg,
@@ -11,32 +13,19 @@ from mjlab.rl import (
 )
 
 
-def unitree_go2_parkour_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
-  """Create RL runner configuration for Go2 parkour with vision."""
+def unitree_go2_walking_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
   return RslRlOnPolicyRunnerCfg(
-    # Actor: CNNModel processes depth (2D) + proprioception (1D).
     actor=RslRlModelCfg(
-      class_name="CNNModel",
-      hidden_dims=(256, 128),
+      class_name="MLPModel",
+      hidden_dims=(512, 256, 128),
       activation="elu",
       obs_normalization=True,
-      cnn_cfg={
-        "output_channels": (32, 64, 64),
-        "kernel_size": (5, 3, 3),
-        "stride": (2, 2, 2),
-        "padding": "zeros",
-        "activation": "elu",
-        "norm": "none",
-        "max_pool": False,
-        "global_pool": "avg",
-      },
       distribution_cfg={
         "class_name": "GaussianDistribution",
         "init_std": 1.0,
         "std_type": "scalar",
       },
     ),
-    # Critic: MLP with privileged observations (no depth needed).
     critic=RslRlModelCfg(
       class_name="MLPModel",
       hidden_dims=(512, 256, 128),
@@ -57,13 +46,12 @@ def unitree_go2_parkour_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       desired_kl=0.01,
       max_grad_norm=1.0,
     ),
-    # Map observation groups from env to model inputs.
     obs_groups={
-      "actor": ("proprioception", "depth"),
+      "actor": ("proprioception",),
       "critic": ("critic",),
     },
-    experiment_name="go2_parkour",
+    experiment_name="go2_walking_shield",
     save_interval=100,
     num_steps_per_env=24,
-    max_iterations=200_000,
+    max_iterations=10_001,
   )

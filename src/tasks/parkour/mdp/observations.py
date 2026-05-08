@@ -35,7 +35,11 @@ def depth_image(
   assert data.depth is not None, "Depth not enabled on camera sensor."
   depth = data.depth  # (num_envs, H, W, 1)
 
-  # Clip to valid range and normalize to [0, 1].
+  # MuJoCo returns 0 for rays that hit no geometry (open air, gap void, sky).
+  # Without this fix, gaps appear black (≈ wall at 1 cm) — indistinguishable
+  # from a close obstacle and impossible for the CNN to learn from.
+  # Remap no-hit pixels to far_clip so open space appears bright (far), not dark (near).
+  depth = torch.where(depth < near_clip, torch.full_like(depth, far_clip), depth)
   depth = torch.clamp(depth, near_clip, far_clip)
   depth = (depth - near_clip) / (far_clip - near_clip)
 

@@ -1,0 +1,1 @@
+"""Walking task package."""

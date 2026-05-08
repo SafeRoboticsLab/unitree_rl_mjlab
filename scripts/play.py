@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import torch
 import tyro
 
@@ -45,8 +46,10 @@ class _DepthOverlay:
       return True
 
     frame = depth[self._env_idx, :, :, 0].cpu().numpy()
-    # Clip to useful range and normalise to 0-255.
     near, far = 0.01, 3.0
+    # Remap no-hit pixels (0 = open air / gap void) to far so they appear
+    # bright — matches the fix in depth_image() that the CNN actually receives.
+    frame = np.where(frame < near, far, frame)
     frame = frame.clip(near, far)
     frame = ((frame - near) / (far - near) * 255).astype("uint8")
     # Apply colourmap for better visibility.
