@@ -19,6 +19,68 @@ from mjlab.utils.wrappers import VideoRecorder
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 
 
+class _DepthOverlay:
+  """Pulls the depth camera tensor from a parkour env and shows it via OpenCV."""
+
+  def __init__(self, env: ManagerBasedRlEnv, sensor_name: str, env_idx: int = 0):
+    import cv2
+    self._cv2 = cv2
+    self._env = env
+    self._sensor_name = sensor_name
+    self._env_idx = env_idx
+    self._window = "Depth Observation"
+    cv2.namedWindow(self._window, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(self._window, 320, 320)
+
+  def update(self) -> bool:
+    """Refresh the depth window. Returns False if user closed it (pressed 'q')."""
+    cv2 = self._cv2
+    try:
+      sensor = self._env.scene[self._sensor_name]
+    except KeyError:
+      return True  # sensor not present, silently skip
+
+    depth = sensor.data.depth  # (B, H, W, 1)
+    if depth is None:
+      return True
+
+    frame = depth[self._env_idx, :, :, 0].cpu().numpy()
+    # Clip to useful range and normalise to 0-255.
+    near, far = 0.01, 3.0
+    frame = frame.clip(near, far)
+    frame = ((frame - near) / (far - near) * 255).astype("uint8")
+    # Apply colourmap for better visibility.
+    frame = cv2.applyColorMap(frame, cv2.COLORMAP_INFERNO)
+    cv2.imshow(self._window, frame)
+    key = cv2.waitKey(1) & 0xFF
+    return key != ord("q")
+
+  def close(self):
+    self._cv2.destroyWindow(self._window)
+
+
+def _run_with_depth(viewer, depth_overlay: _DepthOverlay):
+  """Run the viewer main loop with a per-frame depth overlay update."""
+  import time
+
+  viewer.setup()
+  now = time.perf_counter()
+  viewer._stats_last_time = now
+  viewer._last_tick_time = now
+  try:
+    while viewer.is_running():
+      rendered = viewer.tick()
+      if rendered:
+        if not depth_overlay.update():
+          break
+      else:
+        time.sleep(0.001)
+      viewer._update_stats()
+  finally:
+    depth_overlay.close()
+    viewer.close()
+
+
 @dataclass(frozen=True)
 class PlayConfig:
   agent: Literal["zero", "random", "trained"] = "trained"
@@ -34,6 +96,10 @@ class PlayConfig:
   viewer: Literal["auto", "native", "viser"] = "auto"
   no_terminations: bool = False
   """Disable all termination conditions (useful for viewing motions with dummy agents)."""
+  show_depth: bool = False
+  """Show live depth camera observation in a separate OpenCV window (parkour tasks)."""
+  show_depth_env: int = 0
+  """Which environment index to visualize depth for (default: 0)."""
 
   # Internal flag used by demo script.
   _demo_mode: tyro.conf.Suppress[bool] = False
@@ -167,12 +233,22 @@ def run_play(task_id: str, cfg: PlayConfig):
   else:
     resolved_viewer = cfg.viewer
 
+  if cfg.show_depth:
+    depth_viewer = _DepthOverlay(env.unwrapped, sensor_name="front_depth", env_idx=cfg.show_depth_env)
+  else:
+    depth_viewer = None
+
   if resolved_viewer == "native":
-    NativeMujocoViewer(env, policy).run()
+    viewer = NativeMujocoViewer(env, policy)
   elif resolved_viewer == "viser":
-    ViserPlayViewer(env, policy).run()
+    viewer = ViserPlayViewer(env, policy)
   else:
     raise RuntimeError(f"Unsupported viewer backend: {resolved_viewer}")
+
+  if depth_viewer is not None:
+    _run_with_depth(viewer, depth_viewer)
+  else:
+    viewer.run()
 
   env.close()
 
