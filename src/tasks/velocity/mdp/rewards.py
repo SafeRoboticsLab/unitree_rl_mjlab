@@ -20,6 +20,94 @@ if TYPE_CHECKING:
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
+def mean_action_acc(env: "ManagerBasedRlEnv") -> torch.Tensor:
+  """Mean squared second-difference of the raw policy action.
+
+  Used as a logged metric (no reward weight). Returns a per-env scalar.
+  """
+  action_acc = (
+    env.action_manager.action
+    - 2.0 * env.action_manager.prev_action
+    + env.action_manager.prev_prev_action
+  )
+  return torch.mean(torch.square(action_acc), dim=1)
+
+
+def track_ee_pose_l1(
+  env: "ManagerBasedRlEnv",
+  command_name: str,
+  std: float = 1.0,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  ee_site_name: str = "gripper_site",
+) -> torch.Tensor:
+  """Reward exp(-|[p,o] - [p_cmd,o_cmd]|_1 / std) for end-effector pose.
+
+  ``command_name`` must point to a 7-D world-frame [p, q] command (e.g. the
+  ``UniformEEPoseCommand`` used by the wholebody task).
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  command = env.command_manager.get_command(command_name)
+  assert command is not None and command.shape[-1] == 7, (
+    f"Expected 7-D pose command for '{command_name}', got {None if command is None else command.shape}"
+  )
+  site_ids, _ = asset.find_sites(ee_site_name)
+  ee_pos_w = asset.data.site_pos_w[:, site_ids[0]]
+  ee_quat_w = asset.data.site_quat_w[:, site_ids[0]]
+  pos_err = torch.sum(torch.abs(ee_pos_w - command[:, 0:3]), dim=-1)
+  # Quaternion L1: 4-vector difference, taking the closest-quaternion sign.
+  q_cmd = command[:, 3:7]
+  sign = torch.sign((ee_quat_w * q_cmd).sum(dim=-1, keepdim=True))
+  sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+  quat_err = torch.sum(torch.abs(ee_quat_w - sign * q_cmd), dim=-1)
+  return torch.exp(-(pos_err + quat_err) / std)
+
+
+def joint_energy_l1(
+  env: "ManagerBasedRlEnv",
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Sum_j |τ_j · q̇_j| over the joints listed in ``asset_cfg.joint_names``.
+
+  Pairs joint ids and actuator ids by name — this is correct only when each
+  joint has at most one actuator and the actuator's target is that joint
+  (the case for ``BuiltinPositionActuatorCfg`` used everywhere here).
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  jnt_ids = asset_cfg.joint_ids
+  jnt_vel = asset.data.joint_vel[:, jnt_ids]
+  # Resolve matching actuator ids from joint names.
+  joint_names = (
+    asset.joint_names
+    if isinstance(jnt_ids, slice)
+    else [asset.joint_names[i] for i in jnt_ids]
+  )
+  act_ids, _ = asset.find_actuators(joint_names, preserve_order=True)
+  forces = asset.data.actuator_force[:, act_ids]
+  return torch.sum(torch.abs(forces * jnt_vel), dim=-1)
+
+
+def joint_energy_sq(
+  env: "ManagerBasedRlEnv",
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Sum_j (τ_j · q̇_j)^2 over the joints listed in ``asset_cfg.joint_names``.
+
+  Squared form (vs. ``joint_energy_l1``) — encourages both lower mean and
+  lower variance across joints, per the ManipLoco paper's leg energy term.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  jnt_ids = asset_cfg.joint_ids
+  jnt_vel = asset.data.joint_vel[:, jnt_ids]
+  joint_names = (
+    asset.joint_names
+    if isinstance(jnt_ids, slice)
+    else [asset.joint_names[i] for i in jnt_ids]
+  )
+  act_ids, _ = asset.find_actuators(joint_names, preserve_order=True)
+  forces = asset.data.actuator_force[:, act_ids]
+  return torch.sum(torch.square(forces * jnt_vel), dim=-1)
+
+
 def track_linear_velocity(
   env: ManagerBasedRlEnv,
   std: float,

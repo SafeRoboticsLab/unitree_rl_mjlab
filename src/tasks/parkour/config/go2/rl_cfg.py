@@ -30,11 +30,9 @@ def unitree_go2_parkour_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
         "max_pool": False,
         "global_pool": "avg",
       },
-      distribution_cfg={
-        "class_name": "GaussianDistribution",
-        "init_std": 1.0,
-        "std_type": "scalar",
-      },
+      stochastic=True,
+      init_noise_std=1.0,
+      noise_std_type="scalar",
     ),
     # Critic: MLP with privileged observations (no depth needed).
     critic=RslRlModelCfg(

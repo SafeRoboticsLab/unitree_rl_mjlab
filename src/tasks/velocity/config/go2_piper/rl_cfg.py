@@ -1,4 +1,9 @@
-"""RL configuration for Unitree Go2 velocity task."""
+"""RL configuration for Unitree Go2 + Piper arm velocity task.
+
+Same network architecture and algorithm hyperparameters as the Go2-only
+walking policy — the observation and action space match the Go2-only env,
+so policies are interchangeable for replay / warm-start.
+"""
 
 from mjlab.rl import (
   RslRlModelCfg,
@@ -7,8 +12,7 @@ from mjlab.rl import (
 )
 
 
-def unitree_go2_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
-  """Create RL runner configuration for Unitree Go2 velocity task."""
+def unitree_go2_piper_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
   return RslRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
       hidden_dims=(512, 256, 128),
@@ -37,7 +41,7 @@ def unitree_go2_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       desired_kl=0.01,
       max_grad_norm=1.0,
     ),
-    experiment_name="go2_velocity",
+    experiment_name="go2_piper_velocity",
     save_interval=100,
     num_steps_per_env=24,
     max_iterations=10001,

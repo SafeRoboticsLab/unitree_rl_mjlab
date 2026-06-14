@@ -2,12 +2,37 @@
 
 import os
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
 import torch
 import tyro
+
+
+# Tempfile holder so the remapped .pt outlives the function call but gets
+# cleaned up at process exit.
+_REMAP_TMPFILES: list = []
+
+
+def _remap_legacy_checkpoint(resume_path: Path, device: str) -> str:
+  """Return a path to a checkpoint compatible with the current rsl_rl /
+  mjlab MLPModel. If the checkpoint stores the actor log-std under the
+  legacy ``distribution.std_param`` key, write a temp copy with that key
+  renamed to ``std`` and return the temp path. Otherwise return the
+  original path unchanged."""
+  ckpt = torch.load(str(resume_path), map_location=device, weights_only=False)
+  actor_sd = ckpt.get("actor_state_dict") if isinstance(ckpt, dict) else None
+  if actor_sd is None or "distribution.std_param" not in actor_sd:
+    return str(resume_path)
+  actor_sd["std"] = actor_sd.pop("distribution.std_param")
+  tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
+  tmp.close()
+  torch.save(ckpt, tmp.name)
+  _REMAP_TMPFILES.append(tmp.name)
+  print(f"[INFO] Legacy actor std remapped (distribution.std_param → std).")
+  return tmp.name
 
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
@@ -220,8 +245,14 @@ def run_play(task_id: str, cfg: PlayConfig):
   else:
     runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
     runner = runner_cls(env, asdict(agent_cfg), device=device)
+
+    # Legacy mjlab (<=1.1.x) stored the actor log-std under
+    # 'distribution.std_param'; current MLPModel expects 'std'. Remap on
+    # the fly so old checkpoints still load with strict=True. No-op for
+    # checkpoints saved with the current API.
+    load_path = _remap_legacy_checkpoint(resume_path, device)
     runner.load(
-      str(resume_path), load_cfg={"actor": True}, strict=True, map_location=device
+      load_path, load_cfg={"actor": True}, strict=True, map_location=device
     )
     policy = runner.get_inference_policy(device=device)
 

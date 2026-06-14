@@ -2,6 +2,19 @@ from .unitree_go2.go2_constants import (
   get_go2_robot_cfg as get_go2_robot_cfg,
 )
 
+from .unitree_go2_piper.go2_piper_constants import (
+  get_go2_piper_robot_cfg as get_go2_piper_robot_cfg,
+)
+from .unitree_go2_piper.go2_piper_constants import (
+  get_go2_piper_wholebody_robot_cfg as get_go2_piper_wholebody_robot_cfg,
+)
+from .unitree_go2_piper.go2_piper_constants import (
+  GO2_JOINT_REGEX as GO2_JOINT_REGEX,
+)
+from .unitree_go2_piper.go2_piper_constants import (
+  PIPER_JOINT_REGEX as PIPER_JOINT_REGEX,
+)
+
 from .unitree_a2.a2_constants import (
   get_a2_robot_cfg as get_a2_robot_cfg,
 )
