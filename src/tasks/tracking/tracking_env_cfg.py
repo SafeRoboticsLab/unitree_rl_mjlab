@@ -50,10 +50,20 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
     "command": ObservationTermCfg(
       func=mdp.generated_commands, params={"command_name": "motion"}
     ),
+    "motion_anchor_pos_b": ObservationTermCfg(
+      func=mdp.motion_anchor_pos_b,
+      params={"command_name": "motion"},
+      noise=Unoise(n_min=-0.25, n_max=0.25),
+    ),
     "motion_anchor_ori_b": ObservationTermCfg(
       func=mdp.motion_anchor_ori_b,
       params={"command_name": "motion"},
       noise=Unoise(n_min=-0.05, n_max=0.05),
+    ),
+    "base_lin_vel": ObservationTermCfg(
+      func=mdp.builtin_sensor,
+      params={"sensor_name": "robot/imu_lin_vel"},
+      noise=Unoise(n_min=-0.5, n_max=0.5),
     ),
     "base_ang_vel": ObservationTermCfg(
       func=mdp.builtin_sensor,
@@ -168,7 +178,7 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
         "asset_cfg": SceneEntityCfg("robot", body_names=()),  # Set in robot cfg.
         "operation": "add",
         "ranges": {
-          0: (-0.025, 0.025),
+          0: (-0.05, 0.05),
           1: (-0.05, 0.05),
           2: (-0.05, 0.05),
         },

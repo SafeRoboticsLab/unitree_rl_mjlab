@@ -4,7 +4,7 @@
 ## ✳️ 概述
 
 Unitree RL Mjlab 是一个基于 [mjlab](https://github.com/mujocolab/mjlab.git) 构建的强化学习项目，
-使用 MuJoCo 作为物理仿真后端，当前支持 Unitree Go2, A2, G1, H1_2 和 R1 机器人。
+使用 MuJoCo 作为物理仿真后端，当前支持 Unitree Go2, A2, As2, G1, R1, H1_2 和 H2 机器人。
 
 Mjlab 结合了 [Isaac Lab](https://github.com/isaac-sim/IsaacLab) 的成熟高层 API 与 
 [MuJoCo](https://github.com/google-deepmind/mujoco_warp) 的高精度物理引擎，
@@ -80,7 +80,8 @@ python scripts/csv_to_npz.py \
 --input-file src/assets/motions/g1/dance1_subject2.csv \
 --output-name dance1_subject2.npz \
 --input-fps 30 \
---output-fps 50
+--output-fps 50 \
+--robot g1 # g1 or g1_23dof
 ```
 
 **npz文件默认保存路径为**：`src/motions/g1/...`
@@ -90,8 +91,12 @@ python scripts/csv_to_npz.py \
 确保有可用的npz文件之后，执行以下指令进行训练：
 
 ```bash
-python scripts/train.py Unitree-G1-Tracking --motion_file=src/assets/motions/g1/dance1_subject2.npz --env.scene.num-envs=4096
+python scripts/train.py Unitree-G1-Tracking-No-State-Estimation --motion_file=src/assets/motions/g1/dance1_subject2.npz --env.scene.num-envs=4096
 ```
+
+可用任务:
+  - Unitree-G1-Tracking-No-State-Estimation
+  - Unitree-G1-23Dof-Tracking-No-State-Estimation
 
 </div>
 
@@ -123,7 +128,7 @@ python scripts/play.py Unitree-G1-Flat --checkpoint_file=logs/rsl_rl/g1_velocity
 
 查看动作模仿训练效果：
 ```bash
-python scripts/play.py Unitree-G1-Tracking --motion_file=src/assets/motions/g1/dance1_subject2.npz --checkpoint_file=logs/rsl_rl/g1_tracking/2026-xx-xx_xx-xx-xx/model_xx.pt
+python scripts/play.py Unitree-G1-Tracking-No-State-Estimation --motion_file=src/assets/motions/g1/dance1_subject2.npz --checkpoint_file=logs/rsl_rl/g1_tracking/2026-xx-xx_xx-xx-xx/model_xx.pt
 ```
 
 **说明**：
@@ -169,7 +174,36 @@ cmake .. && make
 
 #### 4.5 部署
 
-在编译完成后，执行以下指令：
+## 4.5.1 仿真部署
+
+在实物部署前，建议使用[unitree_mujoco](https://github.com/unitreerobotics/unitree_mujoco)进行仿真部署，防止实物机器人出现异常动作。本框架已将其集成。
+
+编译unitree_mujoco：
+
+```bash
+cd simulate
+mkdir build && cd build
+cmake .. && make -j8
+```
+
+启动仿真器(注意此处需连接上手柄才能启动)：
+
+```bash
+./simulate/build/unitree_mujoco
+```
+
+可在 `simulate/config` 中选择对应机器人
+
+启动仿真控制程序：
+
+```bash
+cd deploy/robots/g1/build
+./g1_ctrl --network=lo
+```
+
+## 4.5.2 实物部署
+
+启动实物控制程序：
 
 ```bash
 cd deploy/robots/g1/build
@@ -177,7 +211,7 @@ cd deploy/robots/g1/build
 ```
 
 **参数说明**：
-- `network`: 连接机器人网卡名称，如 `enp5s0`
+- `network`: 连接机器人网卡名称，仿真部署使用 `lo`，实物机器人如 `enp5s0`(可使用 `ifconfig` 指令查看)
 
 </div>
 

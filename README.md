@@ -25,7 +25,7 @@ python3 scripts/play.py Unitree-Go2-Parkour --checkpoint-file=<path_to_model.pt>
 ## ✳️ Overview
 Unitree RL Mjlab is a reinforcement learning project built upon the
 [mjlab](https://github.com/mujocolab/mjlab.git), using MuJoCo as its 
-physics simulation backend, currently supporting Unitree Go2, A2, G1, H1_2 and R1.
+physics simulation backend, currently supporting Unitree Go2, A2, As2, G1, R1, H1_2 and H2.
 
 Mjlab combines [Isaac Lab](https://github.com/isaac-sim/IsaacLab)'s proven API
 with best-in-class [MuJoCo](https://github.com/google-deepmind/mujoco_warp)
@@ -103,7 +103,8 @@ python scripts/csv_to_npz.py \
 --input-file src/assets/motions/g1/dance1_subject2.csv \
 --output-name dance1_subject2.npz \
 --input-fps 30 \
---output-fps 50
+--output-fps 50 \
+--robot g1 # g1 or g1_23dof
 ```
 
 **npz files will be stored at:**：`src/motions/g1/...`
@@ -113,8 +114,12 @@ python scripts/csv_to_npz.py \
 After generating the NPZ file, launch imitation training:
 
 ```bash
-python scripts/train.py Unitree-G1-Tracking --motion_file=src/assets/motions/g1/dance1_subject2.npz --env.scene.num-envs=4096
+python scripts/train.py Unitree-G1-Tracking-No-State-Estimation --motion_file=src/assets/motions/g1/dance1_subject2.npz --env.scene.num-envs=4096
 ```
+
+Available tasks:
+  - Unitree-G1-Tracking-No-State-Estimation
+  - Unitree-G1-23Dof-Tracking-No-State-Estimation
 
 </div>
 
@@ -146,7 +151,7 @@ python scripts/play.py Unitree-G1-Flat --checkpoint_file=logs/rsl_rl/g1_velocity
 
 Motion imitation:
 ```bash
-python scripts/play.py Unitree-G1-Tracking --motion_file=src/assets/motions/g1/dance1_subject2.npz --checkpoint_file=logs/rsl_rl/g1_tracking/2026-xx-xx_xx-xx-xx/model_xx.pt
+python scripts/play.py Unitree-G1-Tracking-No-State-Estimation --motion_file=src/assets/motions/g1/dance1_subject2.npz --checkpoint_file=logs/rsl_rl/g1_tracking/2026-xx-xx_xx-xx-xx/model_xx.pt
 ```
 
 **Note**：
@@ -194,7 +199,37 @@ cmake .. && make
 
 #### 4.5 Deployment
 
-After Compilation, run：
+## 4.5.1 Simulation Deployment
+
+Before deploying on the real robot, it is recommended to perform simulation deployment using [unitree_mujoco](https://github.com/unitreerobotics/unitree_mujoco)
+to prevent abnormal behaviors on the physical robot. This framework has already integrated it.
+
+Build unitree_mujoco：
+
+```bash
+cd simulate
+mkdir build && cd build
+cmake .. && make -j8
+```
+
+Launch the simulator (note that a gamepad must be connected):
+
+```bash
+./simulate/build/unitree_mujoco
+```
+
+You can select the corresponding robot in `simulate/config`
+
+Launch the simulation control program:
+
+```bash
+cd deploy/robots/g1/build
+./g1_ctrl --network=lo
+```
+
+## 4.5.2 Real-Robot Deployment
+
+Launch the control program on the real robot:
 
 ```bash
 cd deploy/robots/g1/build
@@ -202,7 +237,7 @@ cd deploy/robots/g1/build
 ```
 
 **Arguments**：
-- `network`: Ethernet interface name (e.g., `enp5s0`)
+- `network`: The network interface used to connect to the robot. Use `lo` for simulation deployment, and `enp5s0` for the real robot(You can check it using the `ifconfig` command) 
 
 </div>
 
