@@ -462,6 +462,127 @@ PARKOUR_TERRAINS_CFG = TerrainGeneratorCfg(
 )
 
 
+# Gaps-only terrain for the minimal reach-avoid gap experiment.  A single gap
+# per patch (flat approach -> gap -> flat landing), with gap width spanning
+# clearly-jumpable to clearly-uncrossable across the difficulty rows.
+# ``curriculum=False`` so every width is present from the start (paired with a
+# ``randomize_terrain`` reset event the policy faces a random width each
+# episode), sidestepping the distance-based-curriculum stall.
+GAP_ONLY_TERRAINS_CFG = TerrainGeneratorCfg(
+  curriculum=False,
+  size=(8.0, 3.0),
+  border_width=5.0,
+  num_rows=10,
+  num_cols=10,
+  color_scheme="none",
+  sub_terrains={
+    "gap_jump": GapJumpTerrainCfg(
+      proportion=1.0,
+      num_gaps=1,
+      gap_width_range=(0.1, 1.0),
+      gap_depth=1.0,
+    ),
+  },
+)
+
+
+@dataclass(kw_only=True)
+class GapEdgeTerrainCfg(SubTerrainCfg):
+  """Single gap with the near edge at a FIXED location (the patch origin).
+
+  Layout along +x: short approach platform -> gap -> landing platform.  The
+  patch ORIGIN is placed at the near edge, so the reset event can spawn the
+  robot relative to the edge (just before it for the commit-or-refuse decision,
+  or mid-air just past it for finish-the-jump) using ``env_origins`` alone,
+  without needing the per-patch gap width.  This is the **pure-jump** terrain:
+  Policy 2 only ever acts near/over the gap, never walking the approach.
+  """
+
+  gap_width_range: tuple[float, float] = (0.1, 1.0)
+  gap_depth: float = 1.0
+  approach_length: float = 2.0
+
+  def function(
+    self, difficulty: float, spec: mujoco.MjSpec, rng: np.random.Generator
+  ) -> TerrainOutput:
+    body = spec.body("terrain")
+    geometries: list[TerrainGeometry] = []
+
+    gap_width = self.gap_width_range[0] + difficulty * (
+      self.gap_width_range[1] - self.gap_width_range[0]
+    )
+    track_length = self.size[0]
+    track_width = self.size[1]
+    edge_x = self.approach_length  # near edge fixed here (== patch origin x)
+
+    # Approach platform [0, edge_x].
+    _add_box(
+      body, geometries,
+      pos=(edge_x / 2, track_width / 2, 0.0),
+      size=(edge_x / 2, track_width / 2, 0.01),
+    )
+
+    # Gap edge walls + floor [edge_x, edge_x + gap_width].
+    wt = 0.02
+    wh = self.gap_depth
+    _add_box(
+      body, geometries,
+      pos=(edge_x + wt / 2, track_width / 2, -wh / 2),
+      size=(wt / 2, track_width / 2, wh / 2), rgba=(0.3, 0.1, 0.1, 1.0),
+    )
+    _add_box(
+      body, geometries,
+      pos=(edge_x + gap_width - wt / 2, track_width / 2, -wh / 2),
+      size=(wt / 2, track_width / 2, wh / 2), rgba=(0.3, 0.1, 0.1, 1.0),
+    )
+    _add_box(
+      body, geometries,
+      pos=(edge_x + gap_width / 2, track_width / 2, -wh),
+      size=(gap_width / 2, track_width / 2, 0.02), rgba=(0.15, 0.05, 0.05, 1.0),
+    )
+
+    # Landing platform [edge_x + gap_width, track_length].
+    landing_start = edge_x + gap_width
+    landing_len = track_length - landing_start
+    if landing_len > 0.01:
+      _add_box(
+        body, geometries,
+        pos=(landing_start + landing_len / 2, track_width / 2, 0.0),
+        size=(landing_len / 2, track_width / 2, 0.01),
+      )
+
+    # Low side curbs (just lane markers; kept short so the follow camera can
+    # see the robot and gap over them).
+    swh, swt = 0.08, 0.05
+    for y_pos in [swt / 2, track_width - swt / 2]:
+      _add_box(
+        body, geometries,
+        pos=(track_length / 2, y_pos, swh / 2),
+        size=(track_length / 2, swt / 2, swh / 2), rgba=(0.4, 0.4, 0.4, 1.0),
+      )
+
+    origin = np.array([edge_x, track_width / 2, 0.0])  # AT the near edge
+    return TerrainOutput(origin=origin, geometries=geometries)
+
+
+GAP_EDGE_TERRAINS_CFG = TerrainGeneratorCfg(
+  curriculum=False,
+  size=(6.0, 2.0),
+  border_width=5.0,
+  num_rows=10,
+  num_cols=10,
+  color_scheme="none",
+  sub_terrains={
+    "gap_edge": GapEdgeTerrainCfg(
+      proportion=1.0,
+      gap_width_range=(0.1, 1.0),
+      gap_depth=1.0,
+      approach_length=2.0,
+    ),
+  },
+)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
