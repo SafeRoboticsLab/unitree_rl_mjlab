@@ -110,6 +110,8 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
       step_trigger=lambda step: step % cfg.video_interval == 0,
       video_length=cfg.video_length,
       disable_logger=True,
+      wandb_log=True,
+      wandb_key="train/video",
     )
     print("[INFO] Recording videos during training.")
 

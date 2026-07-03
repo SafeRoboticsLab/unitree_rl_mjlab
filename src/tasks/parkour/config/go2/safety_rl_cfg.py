@@ -45,11 +45,9 @@ def unitree_go2_parkour_safety_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       # Lower initial std so exploration does not drown out the
       # narrow-range g(s) signal.  ``log`` parameterisation prevents
       # unbounded std growth while the critic learns.
-      distribution_cfg={
-        "class_name": "GaussianDistribution",
-        "init_std": 0.3,
-        "std_type": "log",
-      },
+      stochastic=True,
+      init_noise_std=0.3,
+      noise_std_type="log",
     ),
     # Critic: MLP with privileged observations (includes raycast scan).
     critic=RslRlModelCfg(

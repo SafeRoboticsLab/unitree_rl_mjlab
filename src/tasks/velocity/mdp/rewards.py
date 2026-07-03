@@ -426,3 +426,20 @@ def stand_still(
             reward *= scale
     return reward
 
+
+
+def mean_action_acc(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """Metric: mean squared action acceleration per env.
+
+  Defined here to satisfy the ``mean_action_acc`` metric term referenced by
+  ``make_velocity_env_cfg`` (the function is absent from the locally installed
+  mjlab). Acceleration uses the standard second difference of the raw policy
+  output (action - 2*prev + prev_prev), matching ``mjlab`` ``action_acc_l2``
+  but averaged over the action dimension so it reads as a per-step metric.
+  """
+  action_acc = (
+    env.action_manager.action
+    - 2 * env.action_manager.prev_action
+    + env.action_manager.prev_prev_action
+  )
+  return torch.mean(torch.square(action_acc), dim=1)

@@ -14,4 +14,5 @@ src/assets/motions/g1/dance1_subject2.npz
 *.pyc
 slurm_errs
 slurm_outs
-*.slurm
+*.slurmruns
+datasets

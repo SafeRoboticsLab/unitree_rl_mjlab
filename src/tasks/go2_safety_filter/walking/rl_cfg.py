@@ -20,11 +20,9 @@ def unitree_go2_walking_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       hidden_dims=(512, 256, 128),
       activation="elu",
       obs_normalization=True,
-      distribution_cfg={
-        "class_name": "GaussianDistribution",
-        "init_std": 1.0,
-        "std_type": "scalar",
-      },
+      stochastic=True,
+      init_noise_std=1.0,
+      noise_std_type="scalar",
     ),
     critic=RslRlModelCfg(
       class_name="MLPModel",
