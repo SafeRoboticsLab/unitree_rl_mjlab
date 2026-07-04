@@ -161,14 +161,14 @@ class ParkourReachAvoidVecEnvWrapper(RslRlVecEnvWrapper):
     self._rest_edge_norm = float(rest_edge_norm)
     self._last_ground_ref: torch.Tensor | None = None  # cached by height margin
 
-  def set_rest_edge_clearance(self, value: float) -> None:
-    """Runtime knob for ramping the edge-clearance term in (0 -> 0.3 m)."""
-    self._rest_edge_clearance = float(value)
-
     # Sanity-check the terrain scan sensor exists (terrain-relative g needs it).
     assert self._scan_name in self.unwrapped.scene.sensors, (
       f"Reach-avoid wrapper needs a raycast sensor named '{self._scan_name}'."
     )
+
+  def set_rest_edge_clearance(self, value: float) -> None:
+    """Runtime knob for ramping the edge-clearance term in (0 -> 0.3 m)."""
+    self._rest_edge_clearance = float(value)
 
   # --- Safety margin g(s) -------------------------------------------------
 
@@ -290,6 +290,18 @@ class ParkourReachAvoidVecEnvWrapper(RslRlVecEnvWrapper):
         margins["edge"] = (
           d_edge - self._rest_edge_clearance
         ) / self._rest_edge_norm
+      # Rest exclusion by obstacle x-window (crawl tasks): the down-raycast
+      # cannot see OVERHEAD bars, so bar tasks publish a world-x window
+      # [lo, hi] per env via the env attribute `_rest_obstacle_window_w`
+      # (B, 2). Rest inside the window (just before / under / just past the
+      # beam) does not count as reached — pass-through completion, and the
+      # adversary cannot score by pinning the robot against the bar.
+      # Attribute unset -> term absent -> non-crawl tasks bit-identical.
+      win = getattr(self.unwrapped, "_rest_obstacle_window_w", None)
+      if win is not None:
+        x = robot.data.root_link_pos_w[:, 0]
+        d_out = torch.maximum(win[:, 0] - x, x - win[:, 1])
+        margins["obstacle"] = d_out / 0.3
       return margins
 
     cmd = self.unwrapped.command_manager.get_command(self._command_name)  # (B, >=2)

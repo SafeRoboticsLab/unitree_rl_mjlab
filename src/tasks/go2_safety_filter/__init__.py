@@ -47,6 +47,16 @@ from .crossing.env_cfg import unitree_go2_crossing_env_cfg
 from .crossing.rl_cfg import unitree_go2_crossing_ppo_runner_cfg
 from .crossing.adv_env_cfg import unitree_go2_crossing_adv_env_cfg
 from .gauntlet.env_cfg import unitree_go2_gauntlet_env_cfg
+from .crawl.env_cfg import (
+  unitree_go2_crawl_env_cfg,
+  unitree_go2_crawl_isaacs_env_cfg,
+)
+from .crawl.adv_env_cfg import unitree_go2_crawl_adv_env_cfg
+from .crawl.rl_cfg import (
+  unitree_go2_crawl_avoid_ppo_runner_cfg,
+  unitree_go2_crawl_ppo_runner_cfg,
+)
+from .crawl.isaacs_rl_cfg import unitree_go2_crawl_isaacs_runner_cfg
 
 register_mjlab_task(
   task_id="Unitree-Go2-Walking",
@@ -158,5 +168,50 @@ register_mjlab_task(
   env_cfg=unitree_go2_gauntlet_env_cfg(),
   play_env_cfg=unitree_go2_gauntlet_env_cfg(play=True),
   rl_cfg=unitree_go2_crossing_ppo_runner_cfg(),
+  runner_cls=ParkourSafetyOnPolicyRunner,
+)
+
+# Crawl safety filter (skill 2): arrive with momentum at a low bar; STOP if the
+# clearance is below the crouch feasibility floor (~0.22 m; rows 8-9 impossible),
+# else lower the body, crawl through, and settle. FRESH policy (actor natively
+# includes the forward/up bar-scan fans). ReachAvoidPPO + rest objective with a
+# bar rest-exclusion window.
+register_mjlab_task(
+  task_id="Unitree-Go2-Crawl",
+  env_cfg=unitree_go2_crawl_env_cfg(),
+  play_env_cfg=unitree_go2_crawl_env_cfg(play=True),
+  rl_cfg=unitree_go2_crawl_ppo_runner_cfg(),
+  runner_cls=ParkourReachRestOnPolicyRunner,
+)
+
+# Crawl ISAACS increment 0: + sustained RANDOM push curriculum (5 N steps to
+# 50 N). Same rl_cfg/experiment_name as the crawl task -> in-place warm start
+# of the phase-0 checkpoint.
+register_mjlab_task(
+  task_id="Unitree-Go2-Crawl-Adv",
+  env_cfg=unitree_go2_crawl_adv_env_cfg(),
+  play_env_cfg=unitree_go2_crawl_adv_env_cfg(play=True),
+  rl_cfg=unitree_go2_crawl_ppo_runner_cfg(),
+  runner_cls=ParkourReachRestOnPolicyRunner,
+)
+
+# Crawl ISAACS increments 1-2: two-player adversarial reach-avoid + league.
+# Plain cfg (adversarial wrapper owns the wrench channel); stop_margin 0.3 and
+# pinned curricula.
+register_mjlab_task(
+  task_id="Unitree-Go2-Crawl-ISAACS",
+  env_cfg=unitree_go2_crawl_isaacs_env_cfg(),
+  play_env_cfg=unitree_go2_crawl_isaacs_env_cfg(play=True),
+  rl_cfg=unitree_go2_crawl_isaacs_runner_cfg(),
+  runner_cls=Go2IsaacsOnPolicyRunner,
+)
+
+# Avoid-only baseline (SafetyPPO, g only): predicted stop-always at the bar —
+# the motivating contrast row of the crawl benchmark.
+register_mjlab_task(
+  task_id="Unitree-Go2-Crawl-Avoid",
+  env_cfg=unitree_go2_crawl_env_cfg(),
+  play_env_cfg=unitree_go2_crawl_env_cfg(play=True),
+  rl_cfg=unitree_go2_crawl_avoid_ppo_runner_cfg(),
   runner_cls=ParkourSafetyOnPolicyRunner,
 )

@@ -118,3 +118,31 @@ def phase(
   stand_mask = torch.linalg.norm(command, dim=1) < 0.1
   out = torch.where(stand_mask.unsqueeze(1), torch.zeros_like(out), out)
   return out
+
+
+def ray_distances(
+  env: ManagerBasedRlEnv, sensor_name: str, max_distance: float = 4.0
+) -> torch.Tensor:
+  """Normalized raycast distances for non-down sensors (e.g. forward bar scan).
+
+  The stock ``height_scan`` semantics (base height minus hit z) only make
+  sense for downward grids; forward/up rays report the raw distance instead.
+  Misses (distance < 0) map to 1.0 = "nothing within range".
+  """
+  scan = env.scene[sensor_name]
+  d = scan.data.distances
+  return torch.where(d < 0, torch.ones_like(d), (d / max_distance).clamp(0.0, 1.0))
+
+
+def bar_info(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """Privileged analytic bar observation: [dist_to_bar_face/4 (clamped ±1),
+  under-beam clearance].  Requires the crawl-filter terrain (bar face at
+  ``_BAR_X`` from each patch origin; clearance from the difficulty row)."""
+  from src.isaacs_go2.crawl_filter_terrain import _BAR_X, bar_clearance_for_level
+
+  terrain = env.scene.terrain
+  robot: Entity = env.scene["robot"]
+  bar_x = env.scene.env_origins[:, 0] + _BAR_X
+  dist = ((bar_x - robot.data.root_link_pos_w[:, 0]) / 4.0).clamp(-1.0, 1.0)
+  clearance = bar_clearance_for_level(terrain.terrain_levels)
+  return torch.stack([dist, clearance], dim=1)
