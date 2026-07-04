@@ -30,6 +30,7 @@ from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import GridPatternCfg, ObjRef, RayCastSensorCfg
 from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_mul, sample_uniform
 
@@ -53,10 +54,11 @@ _T_MIN = 0.25
 _NOSE = 0.35          # body reach ahead of base center
 _VX_CAP = 3.4
 
-# Spawn strata (passable rows).
-_FRAC_STOPPABLE = 0.30
+# Spawn strata (passable rows). Mid-crawl carries the skill being learned;
+# braking (stoppable) was mastered immediately.
+_FRAC_STOPPABLE = 0.20
 _FRAC_MUSTCRAWL = 0.30
-_FRAC_MIDCRAWL = 0.15
+_FRAC_MIDCRAWL = 0.25
 _FRAC_DOOMED = 0.05   # remainder 0.20 = handover replay
 # Impossible rows re-weight: stoppable 0.55 / doomed 0.25 / handover 0.20.
 
@@ -152,12 +154,16 @@ def reset_takeover_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot"),
   hdata = _handover_data(device)
 
   r = u(0.0, 1.0)
-  # Passable-row strata boundaries.
-  stoppable = r < _FRAC_STOPPABLE
-  mustcrawl = (r >= _FRAC_STOPPABLE) & (r < _FRAC_STOPPABLE + _FRAC_MUSTCRAWL)
-  midcrawl = (r >= 0.60) & (r < 0.60 + _FRAC_MIDCRAWL)
-  doomed = (r >= 0.75) & (r < 0.75 + _FRAC_DOOMED)
-  handover = r >= 0.80
+  # Passable-row strata boundaries (cumulative).
+  _b1 = _FRAC_STOPPABLE
+  _b2 = _b1 + _FRAC_MUSTCRAWL
+  _b3 = _b2 + _FRAC_MIDCRAWL
+  _b4 = _b3 + _FRAC_DOOMED
+  stoppable = r < _b1
+  mustcrawl = (r >= _b1) & (r < _b2)
+  midcrawl = (r >= _b2) & (r < _b3)
+  doomed = (r >= _b3) & (r < _b4)
+  handover = r >= _b4
   # Impossible rows: no crawl mass — stoppable 0.55 / doomed 0.25 / handover 0.20.
   stoppable = torch.where(impossible, r < 0.55, stoppable)
   doomed = torch.where(impossible, (r >= 0.55) & (r < 0.80), doomed)
@@ -323,6 +329,33 @@ def apply_handover_joints_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot"))
     env._handover_jpos[ids], env._handover_jvel[ids], env_ids=ids)
 
 
+def rested_in_target(env, hold_steps: int = 50, v_rest: float = 0.3):
+  """Absorbing target set: end the episode (as a bootstrapped TIME-OUT, not a
+  failure) once the robot has held rest outside the obstacle window for
+  ``hold_steps`` control steps.  Mirrors the wrapper's l >= 0 condition
+  (rest margin + obstacle window; ISAACS reach-avoid episodes end on reaching
+  the target set).  Without this, successful episodes pad ~7 s of zero-
+  advantage crouched sitting (decisive settle-vs-snap transitions were ~1% of
+  each batch) and any post-rest wobble both fails the success metric and
+  demotes the assist curriculum — wins and falls stayed balanced and the
+  curricula froze."""
+  robot = env.scene["robot"]
+  spd = robot.data.root_link_lin_vel_w[:, :2].norm(dim=1)
+  ok = spd < v_rest
+  win = getattr(env, "_rest_obstacle_window_w", None)
+  if win is not None:
+    x = robot.data.root_link_pos_w[:, 0]
+    ok &= (win[:, 0] > x) | (x > win[:, 1])
+  cnt = getattr(env, "_rest_hold_cnt", None)
+  if cnt is None:
+    env._rest_hold_cnt = torch.zeros(
+      env.num_envs, dtype=torch.long, device=env.device)
+    cnt = env._rest_hold_cnt
+  cnt[:] = torch.where(env.episode_length_buf <= 1, torch.zeros_like(cnt), cnt)
+  cnt[:] = torch.where(ok, cnt + 1, torch.zeros_like(cnt))
+  return cnt >= hold_steps
+
+
 # --- curricula ----------------------------------------------------------------
 # Curricula run at reset BEFORE the reset events, so robot state is still the
 # episode's final state (same trick terrain_levels_parkour uses).
@@ -448,6 +481,11 @@ def unitree_go2_crawl_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # The parkour base adds a per-reset terrain re-roll in play mode; it breaks
   # row pinning (the clearance rows ARE the benchmark axis) — drop it.
   cfg.events.pop("randomize_terrain", None)
+
+  # Absorbing target set: holding rest for 1 s ends the episode as a
+  # bootstrapped time-out (success), not a failure.
+  cfg.terminations["rested_in_target"] = TerminationTermCfg(
+    func=rested_in_target, params={"hold_steps": 50}, time_out=True)
 
   # Phase-offset-invariant gait clock (same rationale as crossing_chain).
   import copy as _copy
