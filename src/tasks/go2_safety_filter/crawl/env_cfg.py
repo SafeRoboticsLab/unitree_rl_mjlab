@@ -221,10 +221,21 @@ def reset_takeover_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot"),
   x_mid_hard = _BAR_X + BAR_DEPTH * u(0.0, 1.0)
   x_mid_easy = _BAR_X + BAR_DEPTH + u(0.4, 0.9)
   x = torch.where(midcrawl, torch.where(easy, x_mid_easy, x_mid_hard), x)
-  z_mid = torch.minimum(u(0.15, 0.19), clearance - 0.075) - 0.32  # rel default z
-  z_mid_easy = u(0.15, 0.19) - 0.32
+  # Spawn z must match the crouch-pose standing equilibrium (measured: 0.166 m
+  # for the shallow crouch, feet-borne). A few cm of ground penetration ejects
+  # the robot and the policy's stand-up snap then slams the calves through the
+  # 10 N contact margin at t0 — every crouch spawn died before any learning
+  # signal existed. Spawn 1-3 cm ABOVE equilibrium (gentle settle), never below.
+  alpha_c = ((0.30 - clearance) / 0.08).clamp(0.0, 1.0)
+  z_eq = 0.166 - 0.02 * alpha_c
+  z_mid = torch.minimum(z_eq + u(0.005, 0.02), clearance - 0.075) - 0.32
+  z_mid_easy = z_eq + u(0.01, 0.03) - 0.32
   z = torch.where(midcrawl, torch.where(easy, z_mid_easy, z_mid), z)
-  vx = torch.where(midcrawl, u(0.6, 1.6), vx)
+  # Easy spawns arrive slow: less kinetic energy through the stand-up snap.
+  vx = torch.where(midcrawl, torch.where(easy, u(0.3, 0.9), u(0.6, 1.4)), vx)
+  # Pre-crouched approach spawns get the same equilibrium z (they previously
+  # spawned at standing height and dropped 20 cm onto crouched legs).
+  z = torch.where(pre_crouched, z_eq + u(0.01, 0.03) - 0.32, z)
 
   # crouch mask + depth: mid-crawl always; pre-crouched must-crawl too
   crouch = midcrawl | pre_crouched
@@ -286,14 +297,16 @@ def apply_crouch_joints(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
   jpos = asset.data.default_joint_pos[ids].clone()
   thigh = _CROUCH_SHALLOW[0] + (_CROUCH_DEEP[0] - _CROUCH_SHALLOW[0]) * alpha
   calf = _CROUCH_SHALLOW[1] + (_CROUCH_DEEP[1] - _CROUCH_SHALLOW[1]) * alpha
-  noise = sample_uniform(-0.05, 0.05, (m, 12), device)
+  # Tight noise + ZERO joint velocity: crouch spawns are transient-fragile
+  # (asymmetric leg loading tips them; any impulse slams calves into the 10 N
+  # contact margin at t0).
+  noise = sample_uniform(-0.02, 0.02, (m, 12), device)
   # Go2 joint layout: per-leg (hip, thigh, calf) x 4 legs.
   for leg in range(4):
     jpos[:, 3 * leg + 1] = thigh.squeeze(-1)
     jpos[:, 3 * leg + 2] = calf.squeeze(-1)
   jpos += noise
-  jvel = sample_uniform(-0.5, 0.5, (m, 12), device)
-  asset.write_joint_state_to_sim(jpos, jvel, env_ids=ids)
+  asset.write_joint_state_to_sim(jpos, torch.zeros_like(jpos), env_ids=ids)
 
 
 def apply_handover_joints_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
