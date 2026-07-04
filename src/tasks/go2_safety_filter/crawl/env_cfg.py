@@ -72,6 +72,7 @@ def _ensure_crawl_buffers(env):
     n, dev = env.num_envs, env.device
     env._crawl_level = torch.zeros(n, dtype=torch.long, device=dev)
     env._was_mustcrawl = torch.zeros(n, dtype=torch.bool, device=dev)
+    env._was_crawlwin = torch.zeros(n, dtype=torch.bool, device=dev)
     env._crouch_mask = torch.zeros(n, dtype=torch.bool, device=dev)
     env._crouch_alpha = torch.zeros(n, device=dev)
     env._handover_mask = torch.zeros(n, dtype=torch.bool, device=dev)
@@ -168,6 +169,7 @@ def reset_takeover_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot"),
     handover = torch.zeros_like(handover)
 
   env._was_mustcrawl[env_ids] = mustcrawl
+  env._was_crawlwin[env_ids] = mustcrawl | midcrawl
   env._handover_mask[env_ids] = handover
   env._crouch_mask[env_ids] = False
 
@@ -205,16 +207,23 @@ def reset_takeover_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot"),
   z = 0.05 + u(-0.02, 0.02)
   vz = u(-0.05, 0.05)
 
-  # mid-crawl: under the beam, crouched, moving through. At high assist spawn
-  # near the EXIT edge — the win ("hold crouch ~0.3 s, coast out, settle") is
-  # near-certain under exploration there, seeding the past-bar rest value that
-  # the reverse curriculum then extends backward (the landing->launch trick;
-  # without it a brake-competent policy parks at the bar forever: the l
-  # gradient points through the beam but standing tall strikes it).
-  x_frac = u(0.0, 1.0) * (1.0 - assist) + u(0.7, 1.0) * assist
-  x = torch.where(midcrawl, _BAR_X + BAR_DEPTH * x_frac, x)
+  # mid-crawl: crouched, moving through/out of the bar. The easiest rung
+  # spawns FULLY CLEARED of the beam (trunk extends +-0.35 m from the base, so
+  # even a base at the exit face still has its rear under the beam and the
+  # policy's stand-up reflex strikes): crouched past exit+0.35, the win is
+  # literally "stand up / settle" — any behavior rests -> l >= 0, seeding the
+  # past-bar rest value. The easy fraction follows the assist knob down and
+  # the hard fraction spawns under the beam, extending the win backward
+  # (landing->launch trick). Without this a brake-competent policy parks at
+  # the bar forever: the l gradient points through the beam but standing
+  # tall strikes it.
+  easy = u(0.0, 1.0) < (0.15 + 0.85 * assist)
+  x_mid_hard = _BAR_X + BAR_DEPTH * u(0.0, 1.0)
+  x_mid_easy = _BAR_X + BAR_DEPTH + u(0.4, 0.9)
+  x = torch.where(midcrawl, torch.where(easy, x_mid_easy, x_mid_hard), x)
   z_mid = torch.minimum(u(0.15, 0.19), clearance - 0.075) - 0.32  # rel default z
-  z = torch.where(midcrawl, z_mid, z)
+  z_mid_easy = u(0.15, 0.19) - 0.32
+  z = torch.where(midcrawl, torch.where(easy, z_mid_easy, z_mid), z)
   vx = torch.where(midcrawl, u(0.6, 1.6), vx)
 
   # crouch mask + depth: mid-crawl always; pre-crouched must-crawl too
@@ -312,12 +321,13 @@ def _crossed_bar(env, env_ids) -> torch.Tensor:
 
 
 def crawl_assist_levels(env, env_ids) -> torch.Tensor:
-  """Per-env reverse curriculum on the crawl: finish a must-crawl episode PAST
-  the bar -> promote (less pre-crouch assist, spawns further out); fall ->
-  demote. Surviving by braking must NOT promote — that withdrew the
-  pre-crouched rare-win foothold while the policy only knew how to stop."""
+  """Per-env reverse curriculum on the crawl: finish a crawl-stratum episode
+  (must-crawl OR mid-crawl) PAST the bar -> promote (less assist: fewer easy
+  cleared spawns, upright spawns further out); fall -> demote. Surviving by
+  braking must NOT promote — that withdrew the pre-crouched rare-win foothold
+  while the policy only knew how to stop."""
   _ensure_crawl_buffers(env)
-  was = env._was_mustcrawl[env_ids]
+  was = env._was_crawlwin[env_ids]
   t_o = env.termination_manager.time_outs[env_ids]
   crossed = _crossed_bar(env, env_ids)
   lvl = env._crawl_level[env_ids]
