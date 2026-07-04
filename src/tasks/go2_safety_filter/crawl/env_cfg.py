@@ -205,11 +205,17 @@ def reset_takeover_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot"),
   z = 0.05 + u(-0.02, 0.02)
   vz = u(-0.05, 0.05)
 
-  # mid-crawl: under the beam, crouched, moving through
-  x = torch.where(midcrawl, _BAR_X + u(0.0, BAR_DEPTH), x)
+  # mid-crawl: under the beam, crouched, moving through. At high assist spawn
+  # near the EXIT edge — the win ("hold crouch ~0.3 s, coast out, settle") is
+  # near-certain under exploration there, seeding the past-bar rest value that
+  # the reverse curriculum then extends backward (the landing->launch trick;
+  # without it a brake-competent policy parks at the bar forever: the l
+  # gradient points through the beam but standing tall strikes it).
+  x_frac = u(0.0, 1.0) * (1.0 - assist) + u(0.7, 1.0) * assist
+  x = torch.where(midcrawl, _BAR_X + BAR_DEPTH * x_frac, x)
   z_mid = torch.minimum(u(0.15, 0.19), clearance - 0.075) - 0.32  # rel default z
   z = torch.where(midcrawl, z_mid, z)
-  vx = torch.where(midcrawl, u(0.4, 1.4), vx)
+  vx = torch.where(midcrawl, u(0.6, 1.6), vx)
 
   # crouch mask + depth: mid-crawl always; pre-crouched must-crawl too
   crouch = midcrawl | pre_crouched
