@@ -4,10 +4,14 @@ Sweeps bar clearance x arrival speed (plus a distance sweep at high speed
 through the must-crawl window) with controlled spawns, and classifies each
 episode:
 
-  STOPPED  — reached rest (l >= 0) before the bar, never unsafe
+  STOPPED  — reached rest (l >= 0) before the bar, never unsafe (only possible
+             on IMPOSSIBLE rows: passable rows exclude the approach from the
+             rest set, so stopping there never satisfies l)
   CRAWLED  — passed the bar and reached rest beyond it, never unsafe
   STRUCK   — ever g < 0 (bar strike / fall), or terminated early
-  UNSET    — timed out without ever reaching rest
+  PARKED   — survived to horizon stationary before the bar without resting
+             counting (safe but non-live on a passable row)
+  UNSET    — survived to horizon without rest, moving / past the bar
 
 Headline science: the learned 50% stop-vs-crawl frontier vs the analytic
 curves — crouch feasibility floor (clearance ~0.22 m) and the brakeability
@@ -77,7 +81,7 @@ def run_cell(wenv, policy, row: int, d: float, v: float, episodes: int, dev: str
   robot = raw.scene["robot"]
   n = raw.num_envs
   horizon = int(raw.max_episode_length) - 2
-  counts = {"STOPPED": 0, "CRAWLED": 0, "STRUCK": 0, "UNSET": 0}
+  counts = {"STOPPED": 0, "CRAWLED": 0, "STRUCK": 0, "PARKED": 0, "UNSET": 0}
 
   done_total = 0
   # Controlled spawns happen INSIDE the reset event (reset_takeover_crawl's
@@ -114,6 +118,8 @@ def run_cell(wenv, policy, row: int, d: float, v: float, episodes: int, dev: str
         break
 
     crossed_at_rest = rest_x > (_BAR_X + BAR_DEPTH)
+    x_final = robot.data.root_link_pos_w[:, 0] - origins[:, 0]
+    spd_final = robot.data.root_link_lin_vel_w[:, :2].norm(dim=1)
     for i in range(n):
       if done_total >= episodes:
         break
@@ -123,6 +129,9 @@ def run_cell(wenv, policy, row: int, d: float, v: float, episodes: int, dev: str
         counts["CRAWLED"] += 1
       elif bool(rested[i]):
         counts["STOPPED"] += 1
+      elif (bool(active[i]) and float(x_final[i]) < _BAR_X
+            and float(spd_final[i]) < 0.5):
+        counts["PARKED"] += 1
       else:
         counts["UNSET"] += 1
       done_total += 1
@@ -171,7 +180,7 @@ def main():
     def cell_str(c):
       tot = max(1, sum(c.values()))
       return (f"S{100*c['STOPPED']//tot:3d} C{100*c['CRAWLED']//tot:3d} "
-              f"X{100*c['STRUCK']//tot:3d}")
+              f"X{100*c['STRUCK']//tot:3d} P{100*c['PARKED']//tot:3d}")
     print(f"{clr:6.3f} | " + " | ".join(cell_str(c) for c in cells))
 
   print(f"--- d-sweep @ v = {DSWEEP_V} (brake boundary d = {DSWEEP_V**2/6:.2f} m) ---")
@@ -184,7 +193,7 @@ def main():
       tot = max(1, sum(c.values()))
       print(f"  clr {clr:.3f} d {d:.1f}: STOP {100*c['STOPPED']/tot:5.1f}% "
             f"CRAWL {100*c['CRAWLED']/tot:5.1f}% STRUCK {100*c['STRUCK']/tot:5.1f}% "
-            f"UNSET {100*c['UNSET']/tot:5.1f}%")
+            f"PARKED {100*c['PARKED']/tot:5.1f}% UNSET {100*c['UNSET']/tot:5.1f}%")
 
   out = args.out or os.path.join(os.path.dirname(args.checkpoint),
                                  f"boundary_{tag}.csv")

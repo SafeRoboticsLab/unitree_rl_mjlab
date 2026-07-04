@@ -1,10 +1,12 @@
 """Crawl-filter task: arrive with momentum at a low bar — STOP if the bar is
 impossibly low, otherwise LOWER the body and CRAWL through, then settle.
 
-Same rest objective as the crossing-chain task (l = safe rest + mild crossing
-bias), with a bar-specific rest EXCLUSION window (rest just before / under /
-just past the beam does not count — pass-through completion; the window is
-published to the reach-avoid wrapper via ``env._rest_obstacle_window_w``).
+Rest objective (l = safe rest + mild crossing bias) with a bar-specific rest
+window published to the reach-avoid wrapper via ``env._rest_obstacle_window_w``,
+encoding the stop-vs-crawl dichotomy per row: on PASSABLE rows only rest PAST
+the bar counts (crawl-through is the target — plain rest made braking a
+universal solution and the policy converged to stop-always); on IMPOSSIBLE
+rows rest before the bar is the target.
 
 Decision physics (nose-distance d to the bar face, speed v, brake decel a=3.0,
 crouch time t_c=0.45 s):
@@ -80,14 +82,29 @@ def _ensure_crawl_buffers(env):
 
 
 def set_rest_obstacle_window(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
-  """Publish the per-env rest-exclusion window around the bar (world x)."""
+  """Publish the per-env rest-exclusion window (world x) encoding the task's
+  stop-vs-crawl dichotomy:
+
+  * PASSABLE rows: the whole approach is excluded — only rest PAST the bar
+    counts as reached, so crawling through IS the target maneuver. (Plain
+    rest-before-bar made braking a universal solution: real braking ~5 m/s^2
+    beats the analytic 3.0, the must-crawl window never binds, and the policy
+    converges to stop-always — indistinguishable from the -Avoid baseline.)
+  * IMPOSSIBLE rows: rest before the bar is the target (stop!); past-bar rest
+    is unreachable anyway.
+  """
   if env_ids is None:
     env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
   if len(env_ids) == 0:
     return
   _ensure_crawl_buffers(env)
+  terrain = env.scene.terrain
+  impossible = is_impossible_level(terrain.terrain_levels[env_ids])
   ox = env.scene.env_origins[env_ids, 0]
-  env._rest_obstacle_window_w[env_ids, 0] = ox + _BAR_X - 0.35
+  lo_impossible = ox + _BAR_X - 0.35
+  lo_passable = ox - 100.0
+  env._rest_obstacle_window_w[env_ids, 0] = torch.where(
+    impossible, lo_impossible, lo_passable)
   env._rest_obstacle_window_w[env_ids, 1] = ox + _BAR_X + BAR_DEPTH + 0.40
 
 
@@ -279,15 +296,26 @@ def apply_handover_joints_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot"))
 
 
 # --- curricula ----------------------------------------------------------------
+# Curricula run at reset BEFORE the reset events, so robot state is still the
+# episode's final state (same trick terrain_levels_parkour uses).
+
+def _crossed_bar(env, env_ids) -> torch.Tensor:
+  x_rel = (env.scene["robot"].data.root_link_pos_w[env_ids, 0]
+           - env.scene.env_origins[env_ids, 0])
+  return x_rel > (_BAR_X + BAR_DEPTH)
+
 
 def crawl_assist_levels(env, env_ids) -> torch.Tensor:
-  """Per-env reverse curriculum on the crawl: survive a must-crawl episode ->
-  promote (less pre-crouch assist, spawns further out); fall -> demote."""
+  """Per-env reverse curriculum on the crawl: finish a must-crawl episode PAST
+  the bar -> promote (less pre-crouch assist, spawns further out); fall ->
+  demote. Surviving by braking must NOT promote — that withdrew the
+  pre-crouched rare-win foothold while the policy only knew how to stop."""
   _ensure_crawl_buffers(env)
   was = env._was_mustcrawl[env_ids]
   t_o = env.termination_manager.time_outs[env_ids]
+  crossed = _crossed_bar(env, env_ids)
   lvl = env._crawl_level[env_ids]
-  lvl = torch.where(was & t_o, lvl + 1, lvl)
+  lvl = torch.where(was & t_o & crossed, lvl + 1, lvl)
   lvl = torch.where(was & ~t_o, lvl - 1, lvl)
   env._crawl_level[env_ids] = lvl.clamp(0, _CRAWL_LEVELS)
   return env._crawl_level.float().mean()
@@ -297,24 +325,27 @@ def handover_levels_crawl(env, env_ids) -> torch.Tensor:
   _ensure_crawl_buffers(env)
   was = env._handover_mask[env_ids]
   t_o = env.termination_manager.time_outs[env_ids]
+  crossed = _crossed_bar(env, env_ids)
   lvl = env._handover_level[env_ids]
-  lvl = torch.where(was & t_o, lvl + 1, lvl)
+  lvl = torch.where(was & t_o & crossed, lvl + 1, lvl)
   lvl = torch.where(was & ~t_o, lvl - 1, lvl)
   env._handover_level[env_ids] = lvl.clamp(0, 5)
   return env._handover_level.float().mean()
 
 
 def crawl_filter_levels(env, env_ids) -> torch.Tensor | None:
-  """Terrain gated on the binding skill: promote only on must-crawl success.
-  On impossible rows _was_mustcrawl never fires -> those rows only demote on
-  falls; stopping there is trained without misreading it as crawl mastery."""
+  """Terrain gated on the binding skill: promote only when a must-crawl env
+  actually finished PAST the bar. On impossible rows _was_mustcrawl never
+  fires -> those rows only demote on falls; stopping there is trained without
+  misreading it as crawl mastery."""
   terrain = env.scene.terrain
   if terrain is None or not hasattr(terrain, "update_env_origins"):
     return None
   _ensure_crawl_buffers(env)
   t_o = env.termination_manager.time_outs[env_ids]
   was = env._was_mustcrawl[env_ids]
-  terrain.update_env_origins(env_ids, was & t_o, ~t_o)
+  crossed = _crossed_bar(env, env_ids)
+  terrain.update_env_origins(env_ids, was & t_o & crossed, ~t_o)
   return terrain.terrain_levels.float().mean()
 
 
