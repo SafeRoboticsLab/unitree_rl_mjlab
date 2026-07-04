@@ -104,6 +104,26 @@ def reset_takeover_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot"),
   n = int(len(env_ids))
   root = asset.data.default_root_state[env_ids].clone()
 
+  # Benchmark hook: `env._eval_spawn = {"d": ..., "v": ...}` overrides the
+  # strata with a controlled upright spawn (nose-distance d, speed v) so eval
+  # scripts stay in-band (out-of-band teleports leave staged writes + stale
+  # raycast caches that misfire terrain-relative g/terminations for a step).
+  ev = getattr(env, "_eval_spawn", None)
+  if ev is not None:
+    env._was_mustcrawl[env_ids] = False
+    env._handover_mask[env_ids] = False
+    env._crouch_mask[env_ids] = False
+    positions = root[:, 0:3] + env.scene.env_origins[env_ids]
+    positions[:, 0] += _BAR_X - _NOSE - float(ev["d"])
+    positions[:, 2] += 0.02
+    velocities = root[:, 7:13].clone()
+    velocities[:] = 0.0
+    velocities[:, 0] = float(ev["v"])
+    asset.write_root_link_pose_to_sim(
+      torch.cat([positions, root[:, 3:7]], dim=-1), env_ids=env_ids)
+    asset.write_root_link_velocity_to_sim(velocities, env_ids=env_ids)
+    return
+
   def u(lo, hi):
     return sample_uniform(lo, hi, (n,), device)
 
@@ -365,6 +385,9 @@ def unitree_go2_crawl_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.events["rest_obstacle_window"] = EventTermCfg(
     func=set_rest_obstacle_window, mode="reset", params={})
   cfg.events.pop("push_robot", None)
+  # The parkour base adds a per-reset terrain re-roll in play mode; it breaks
+  # row pinning (the clearance rows ARE the benchmark axis) — drop it.
+  cfg.events.pop("randomize_terrain", None)
 
   # Phase-offset-invariant gait clock (same rationale as crossing_chain).
   import copy as _copy
