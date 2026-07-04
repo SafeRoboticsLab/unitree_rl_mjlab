@@ -21,9 +21,15 @@ from src.tasks.parkour.rl import (
   ParkourReachRestOnPolicyRunner,
   ParkourSafetyOnPolicyRunner,
 )
+from src.tasks.parkour.rl.isaacs_runner import Go2IsaacsOnPolicyRunner
 
-from .crossing_chain.env_cfg import unitree_go2_crossing_chain_env_cfg
+from .crossing_chain.env_cfg import (
+  unitree_go2_crossing_chain_env_cfg,
+  unitree_go2_crossing_chain_isaacs_env_cfg,
+)
+from .crossing_chain.adv_env_cfg import unitree_go2_crossing_chain_adv_env_cfg
 from .crossing_chain.rl_cfg import unitree_go2_crossing_chain_ppo_runner_cfg
+from .crossing_chain.isaacs_rl_cfg import unitree_go2_crossing_chain_isaacs_runner_cfg
 
 from .walking.env_cfg import unitree_go2_walking_env_cfg
 from .walking.rl_cfg import unitree_go2_walking_ppo_runner_cfg
@@ -122,6 +128,28 @@ register_mjlab_task(
   play_env_cfg=unitree_go2_crossing_chain_env_cfg(play=True),
   rl_cfg=unitree_go2_crossing_chain_ppo_runner_cfg(),
   runner_cls=ParkourReachRestOnPolicyRunner,
+)
+
+# ISAACS increment 0: crossing-chain + sustained RANDOM base push with a per-env
+# force curriculum (5 N steps up to 50 N = the game's disturbance bound). Same
+# rl_cfg/experiment_name as the chain task so it warm-starts model_28799.
+register_mjlab_task(
+  task_id="Unitree-Go2-Crossing-Chain-Adv",
+  env_cfg=unitree_go2_crossing_chain_adv_env_cfg(),
+  play_env_cfg=unitree_go2_crossing_chain_adv_env_cfg(play=True),
+  rl_cfg=unitree_go2_crossing_chain_ppo_runner_cfg(),
+  runner_cls=ParkourReachRestOnPolicyRunner,
+)
+
+# ISAACS increments 1-2: two-player adversarial reach-avoid. Plain env cfg (no
+# push event: the adversarial wrapper owns the wrench channel); reset_takeover
+# gets edge_margin=0.3 so 'stoppable' matches the robustified rest set.
+register_mjlab_task(
+  task_id="Unitree-Go2-Crossing-Chain-ISAACS",
+  env_cfg=unitree_go2_crossing_chain_isaacs_env_cfg(),
+  play_env_cfg=unitree_go2_crossing_chain_isaacs_env_cfg(play=True),
+  rl_cfg=unitree_go2_crossing_chain_isaacs_runner_cfg(),
+  runner_cls=Go2IsaacsOnPolicyRunner,
 )
 
 # Gauntlet eval: progressive gaps-grow/platforms-shrink track.

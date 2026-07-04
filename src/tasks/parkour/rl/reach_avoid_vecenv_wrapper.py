@@ -127,6 +127,8 @@ class ParkourReachAvoidVecEnvWrapper(RslRlVecEnvWrapper):
     v_rest_norm: float = 0.5,
     cross_bias_weight: float = 0.3,
     cross_bias_scale: float = 3.0,
+    rest_edge_clearance: float = 0.0,
+    rest_edge_norm: float = 0.3,
   ) -> None:
     super().__init__(env, clip_actions=clip_actions)
 
@@ -151,6 +153,17 @@ class ParkourReachAvoidVecEnvWrapper(RslRlVecEnvWrapper):
     self._cross_bias_weight = float(cross_bias_weight)
     self._cross_bias_scale = float(cross_bias_scale)
     self._spawn_x: torch.Tensor | None = None  # per-env spawn x (rest mode)
+    # Robustified rest (adversarial games): rest within `rest_edge_clearance`
+    # of a gap edge does NOT count as reached (the disturbance can shove a
+    # resting robot in — the reach set must be robust to be meaningful).
+    # 0.0 disables the term (single-agent behavior bit-identical).
+    self._rest_edge_clearance = float(rest_edge_clearance)
+    self._rest_edge_norm = float(rest_edge_norm)
+    self._last_ground_ref: torch.Tensor | None = None  # cached by height margin
+
+  def set_rest_edge_clearance(self, value: float) -> None:
+    """Runtime knob for ramping the edge-clearance term in (0 -> 0.3 m)."""
+    self._rest_edge_clearance = float(value)
 
     # Sanity-check the terrain scan sensor exists (terrain-relative g needs it).
     assert self._scan_name in self.unwrapped.scene.sensors, (
@@ -194,6 +207,7 @@ class ParkourReachAvoidVecEnvWrapper(RslRlVecEnvWrapper):
     ground_ref = torch.where(below.any(dim=1), ground_ref, lowest)
 
     clearance = base_z - ground_ref
+    self._last_ground_ref = ground_ref  # cached for the rest-edge reach term
     return clearance - self._min_clearance
 
   def _contact_margin(self, like: torch.Tensor) -> torch.Tensor | None:
@@ -255,7 +269,28 @@ class ParkourReachAvoidVecEnvWrapper(RslRlVecEnvWrapper):
         self._spawn_x = robot.data.root_link_pos_w[:, 0].clone()
       prog = ((robot.data.root_link_pos_w[:, 0] - self._spawn_x)
               / self._cross_bias_scale).clamp(0.0, 1.0)
-      return {"rest": l_rest + self._cross_bias_weight * prog}
+      margins = {"rest": l_rest + self._cross_bias_weight * prog}
+      if self._rest_edge_clearance > 0.0 and self._last_ground_ref is not None:
+        # Rest only counts away from gap edges: min planar distance from the
+        # base to any raycast hit that lies well below the local platform
+        # (i.e. a gap floor). No gap in view -> generous 1.0 m.
+        scan = self.unwrapped.scene[self._scan_name]
+        hit = scan.data.hit_pos_w
+        dist = scan.data.distances
+        base_xy = robot.data.root_link_pos_w[:, None, :2]
+        gap_mask = (dist >= 0) & (
+          hit[..., 2] < self._last_ground_ref[:, None] - 0.2
+        )
+        planar = torch.norm(hit[..., :2] - base_xy, dim=-1)
+        far = torch.full_like(planar, 1.0e9)
+        d_edge = torch.where(gap_mask, planar, far).min(dim=1).values
+        d_edge = torch.where(
+          gap_mask.any(dim=1), d_edge, torch.ones_like(d_edge)
+        )
+        margins["edge"] = (
+          d_edge - self._rest_edge_clearance
+        ) / self._rest_edge_norm
+      return margins
 
     cmd = self.unwrapped.command_manager.get_command(self._command_name)  # (B, >=2)
     v_b = robot.data.root_link_lin_vel_b  # (B, 3)

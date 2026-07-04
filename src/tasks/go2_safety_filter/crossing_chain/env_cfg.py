@@ -99,7 +99,8 @@ def _ensure_jump_buffers(env):
     env._handover_level = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
 
 
-def reset_takeover(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
+def reset_takeover(env, env_ids, asset_cfg=SceneEntityCfg("robot"),
+                   edge_margin: float = 0.0):
   """Takeover-distribution spawn, stratified across the decision boundary.
 
   Three strata (the buffer must contain the jump-or-die states, or the policy
@@ -150,7 +151,9 @@ def reset_takeover(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
   assist = (1.0 - env._jump_level[env_ids].float() / _JUMP_LEVELS).clamp(0.0, 1.0)
   d_unstoppable = u(0.25, 0.55) + (1.0 - assist) * u(0.0, 1.2)
   d = torch.where(unstoppable, d_unstoppable, d)
-  v_boundary = torch.sqrt(2.0 * _A_BRAKE * d)
+  # With a robustified rest set (edge_margin > 0), "stoppable" means brakeable
+  # to rest AT LEAST edge_margin before the gap — shifts the decision boundary.
+  v_boundary = torch.sqrt(2.0 * _A_BRAKE * (d - edge_margin).clamp_min(0.05))
   vx = torch.where(
     stoppable,
     (v_boundary * u(0.15, 0.90)).clamp(_VX_MIN, _VX_MAX),
@@ -345,4 +348,30 @@ def unitree_go2_crossing_chain_env_cfg(play: bool = False) -> ManagerBasedRlEnvC
     "jump_assist": CurriculumTermCfg(func=jump_assist_levels),
     "handover_level": CurriculumTermCfg(func=handover_levels),
   }
+  return cfg
+
+
+# --- ISAACS adversarial phase: pinned curricula -----------------------------
+# Under adversarial pressure the survival-gated curricula demote (the task
+# silently gets easier while the adversary strengthens — a treadmill). During
+# the two-player game the task distribution is PINNED at the levels the
+# warm-start policy mastered; robustification, not skill acquisition, is the
+# objective here.
+
+def pinned_levels(env, env_ids) -> torch.Tensor:
+  _ensure_jump_buffers(env)
+  env._jump_level[env_ids] = 4
+  env._handover_level[env_ids] = 3
+  terrain = env.scene.terrain
+  if terrain is not None and hasattr(terrain, "update_env_origins"):
+    # keep terrain rows where they are (no promote/demote); rows were assigned
+    # at startup and randomize_terrain reshuffles columns/rows per reset.
+    pass
+  return env._jump_level.float().mean()
+
+
+def unitree_go2_crossing_chain_isaacs_env_cfg(play: bool = False):
+  cfg = unitree_go2_crossing_chain_env_cfg(play=play)
+  cfg.events["reset_base"].params["edge_margin"] = 0.3
+  cfg.curriculum = {"pinned_levels": CurriculumTermCfg(func=pinned_levels)}
   return cfg
