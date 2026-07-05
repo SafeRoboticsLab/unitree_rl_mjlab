@@ -85,6 +85,7 @@ def _ensure_crawl_buffers(env):
     n, dev = env.num_envs, env.device
     env._cross_level = torch.zeros(n, dtype=torch.long, device=dev)
     env._was_mustcross = torch.zeros(n, dtype=torch.bool, device=dev)
+    env._mustcross_approach = torch.zeros(n, dtype=torch.bool, device=dev)
     env._crouch_mask = torch.zeros(n, dtype=torch.bool, device=dev)
     env._crouch_alpha = torch.zeros(n, device=dev)
     env._handover_mask = torch.zeros(n, dtype=torch.bool, device=dev)
@@ -181,6 +182,7 @@ def reset_takeover_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot"),
   assist = (1.0 - env._cross_level[env_ids].float() / _CROSS_LEVELS).clamp(0, 1)
   at_exit = mustcross & (u(0.0, 1.0) < assist)
   approach = mustcross & ~at_exit
+  env._mustcross_approach[env_ids] = approach  # only real approach-crossings gate terrain
   # approaching share: fast enough it must cross (unstoppable), varied distance
   d_mc = u(0.3, 1.4)
   vx_mc = torch.maximum(u(1.4, 2.6), torch.sqrt(2.0 * _A_BRAKE * d_mc) * 1.1)
@@ -305,18 +307,21 @@ def handover_levels_crawl(env, env_ids) -> torch.Tensor:
 
 
 def crawl_height_levels(env, env_ids) -> torch.Tensor | None:
-  """Terrain (bar-height) curriculum gated on the binding skill: promote only
-  when a MUST-CROSS env crossed and settled; demote on falls. On impossible
-  rows _was_mustcross never fires -> they only demote on falls, so learning to
-  stop there isn't misread as crawl mastery."""
+  """Terrain (bar-height) curriculum gated on the BINDING skill: promote only
+  when a MUST-CROSS-APPROACH env (started before the bar, not the trivial
+  at-exit share) crossed and settled; demote on falls. Gating on real approach
+  crossings keeps the terrain coupled to the skill (else the always-succeeding
+  at-exit spawns run the bars ahead of what the robot can actually cross).
+  Must run LAST among curricula: it mutates env_origins, which the origin-
+  reading curricula (cross_assist) must see unchanged."""
   terrain = env.scene.terrain
   if terrain is None or not hasattr(terrain, "update_env_origins"):
     return None
   _ensure_crawl_buffers(env)
   t_o = env.termination_manager.time_outs[env_ids]
-  was = env._was_mustcross[env_ids]
+  approach = env._mustcross_approach[env_ids]
   crossed = _crossed_bar(env, env_ids)
-  terrain.update_env_origins(env_ids, was & t_o & crossed, ~t_o)
+  terrain.update_env_origins(env_ids, approach & t_o & crossed, ~t_o)
   return terrain.terrain_levels.float().mean()
 
 
@@ -381,10 +386,13 @@ def unitree_go2_crawl_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     term.params = {"period": period}
     cfg.observations[gname].terms["phase"] = term
 
+  # ORDER MATTERS: cross_assist reads env_origins (via _crossed_bar) and
+  # crawl_height_levels MUTATES env_origins (update_env_origins) -> terrain
+  # MUST run last, else cross_assist reads moved origins and never promotes.
   cfg.curriculum = {
-    "terrain_levels": CurriculumTermCfg(func=crawl_height_levels),
     "cross_assist": CurriculumTermCfg(func=cross_assist_levels),
     "handover_level": CurriculumTermCfg(func=handover_levels_crawl),
+    "terrain_levels": CurriculumTermCfg(func=crawl_height_levels),
   }
   return cfg
 
