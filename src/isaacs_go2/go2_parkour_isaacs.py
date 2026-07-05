@@ -109,9 +109,15 @@ def parkour_gap_margins(env):
   return g.clamp(-3.0, 3.0), l.clamp(-3.0, 3.0)
 
 
-def parkour_isaacs_hook(env) -> torch.Tensor:
-  """Pre-reset reward-term hook: stash terminal-correct g/l in env.extras."""
-  g, l = parkour_gap_margins(env)
+def parkour_isaacs_hook(env, margin_fn=None) -> torch.Tensor:
+  """Pre-reset reward-term hook: stash terminal-correct g/l in env.extras.
+
+  ``margin_fn(env) -> (g, l)`` selects the task's reach-avoid margins
+  (default: the gap foothold+progress margins). g is anchored to the terminal
+  failure value on real terminations, matching the rsl_rl wrapper."""
+  if margin_fn is None:
+    margin_fn = parkour_gap_margins
+  g, l = margin_fn(env)
   failed = env.termination_manager.terminated
   g = torch.where(failed, torch.minimum(g, torch.full_like(g, TERMINAL_MARGIN)), g)
   env.extras["isaacs_g"] = g
@@ -119,12 +125,18 @@ def parkour_isaacs_hook(env) -> torch.Tensor:
   return g
 
 
-def _build_parkour_cfg(num_envs: int):
-  cfg = unitree_go2_gap_reach_avoid_env_cfg(play=False)
+def _build_parkour_cfg(num_envs: int, cfg_builder=None, margin_fn=None):
+  """Build an mjlab env cfg for the SB3 bridge: any go2_safety_filter cfg
+  builder + the isaacs g/l reward hook (the env logic — spawn strata, reverse
+  curricula, handover — is algorithm-agnostic and reused as-is)."""
+  if cfg_builder is None:
+    cfg_builder = unitree_go2_gap_reach_avoid_env_cfg
+  cfg = cfg_builder(play=False)
   cfg.scene.num_envs = int(num_envs)
   if cfg.events is not None:
     cfg.events.pop("push_robot", None)  # learned force adversary replaces it
-  cfg.rewards["isaacs_safety_hook"] = RewardTermCfg(func=parkour_isaacs_hook, weight=1.0, params={})
+  cfg.rewards["isaacs_safety_hook"] = RewardTermCfg(
+    func=parkour_isaacs_hook, weight=1.0, params={"margin_fn": margin_fn})
   return cfg
 
 
@@ -141,7 +153,8 @@ class Go2ParkourIsaacsVecEnv(VecEnv, _ForceMixin):
   """Parallel SB3 VecEnv over the mjlab Go2 gap reach-avoid env + force adversary."""
 
   def __init__(self, num_envs=64, device="cuda:0", render_mode=None, *,
-               ctrl_gain=3.0, force_max=50.0, adversary=True):
+               ctrl_gain=3.0, force_max=50.0, adversary=True,
+               cfg_builder=None, margin_fn=None):
     self._device = device
     self.render_mode = render_mode
     self.ctrl_gain = float(ctrl_gain)
@@ -149,7 +162,8 @@ class Go2ParkourIsaacsVecEnv(VecEnv, _ForceMixin):
     self.adversary = bool(adversary)
 
     self.mj = ManagerBasedRlEnv(
-      cfg=_build_parkour_cfg(num_envs), device=device,
+      cfg=_build_parkour_cfg(num_envs, cfg_builder=cfg_builder, margin_fn=margin_fn),
+      device=device,
       render_mode="rgb_array" if render_mode else None,
     )
     self._robot = self.mj.scene["robot"]
@@ -306,3 +320,58 @@ class Go2ParkourIsaacsEnv(gym.Env, _ForceMixin):
       self.mj.close()
     except Exception:
       pass
+
+
+# ---------------------------------------------------------------------------
+# Separate SB3 VecEnv factories for the jumping pipeline (landing -> crossing ->
+# chain), mirroring the rsl_rl task structure. The mjlab env cfgs carry the
+# spawn strata + reverse curricula + handover; the bridge only swaps the cfg
+# and (for the rest objective) the l margin. Avoid-only stages (landing,
+# crossing) train with safety_sb3 SafetyPPO and ignore l; the chain stage uses
+# ReachAvoidPPO with rest_margins.
+# ---------------------------------------------------------------------------
+
+def rest_margins(env):
+  """Reach-avoid margins for the REST objective (crossing-chain): same g as the
+  gap task; l = come to a safe stop + mild forward-progress cross bias
+  (mirrors ParkourReachAvoidVecEnvWrapper rest mode: v_rest 0.3, norm 0.5,
+  cross_bias 0.3, scale 3.0)."""
+  g, _ = parkour_gap_margins(env)
+  robot = env.scene["robot"]
+  speed = torch.norm(robot.data.root_link_lin_vel_w[:, :2], dim=1)
+  l_rest = (0.3 - speed) / 0.5
+  origin_x = env.scene.env_origins[:, 0]
+  prog = ((robot.data.root_link_pos_w[:, 0] - origin_x) / 3.0).clamp(0.0, 1.0)
+  l = l_rest + 0.3 * prog
+  return g.clamp(-3.0, 3.0), l.clamp(-3.0, 3.0)
+
+
+def make_landing_vecenv(num_envs=1024, device="cuda:0", **kw):
+  """Avoid-only landing (mid-air-over-gap spawn -> soft land). SafetyPPO."""
+  from src.tasks.go2_safety_filter.landing.env_cfg import (
+    unitree_go2_landing_env_cfg,
+  )
+  return Go2ParkourIsaacsVecEnv(
+    num_envs=num_envs, device=device, adversary=False,
+    cfg_builder=unitree_go2_landing_env_cfg, **kw)
+
+
+def make_crossing_vecenv(num_envs=1024, device="cuda:0", **kw):
+  """Avoid-only reverse-curriculum crossing (launch->land). SafetyPPO."""
+  from src.tasks.go2_safety_filter.crossing.env_cfg import (
+    unitree_go2_crossing_env_cfg,
+  )
+  return Go2ParkourIsaacsVecEnv(
+    num_envs=num_envs, device=device, adversary=False,
+    cfg_builder=unitree_go2_crossing_env_cfg, **kw)
+
+
+def make_chain_vecenv(num_envs=1024, device="cuda:0", adversary=False, **kw):
+  """Rest-objective crossing-chain (arrival momentum -> safe rest). ReachAvoid/
+  IsaacsPPO (adversary=True for the two-player game)."""
+  from src.tasks.go2_safety_filter.crossing_chain.env_cfg import (
+    unitree_go2_crossing_chain_env_cfg,
+  )
+  return Go2ParkourIsaacsVecEnv(
+    num_envs=num_envs, device=device, adversary=adversary,
+    cfg_builder=unitree_go2_crossing_chain_env_cfg, margin_fn=rest_margins, **kw)
