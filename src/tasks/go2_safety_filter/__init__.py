@@ -171,19 +171,18 @@ register_mjlab_task(
   runner_cls=ParkourSafetyOnPolicyRunner,
 )
 
-# Crawl safety filter (skill 2): keep moving forward under a bar, ducking as
-# low as it takes; STOP if the bar is below the crouch feasibility floor.
-# FRESH policy (actor natively includes the forward/up bar-scan fans).
-# ReachAvoidPPO with COMMAND / velocity-liveness reach (l = forward-speed
-# liveness) + a forward HEIGHT curriculum (start high, lower a notch on
-# each crossing). Command mode, not rest: the Go2 can brake out of any
-# approach, so rest collapsed to stop-always.
+# Crawl safety FILTER (skill 2), momentum-reactive: spawned into the takeover
+# distribution (arrival momentum / real walker states via the HANDOVER stratum)
+# and learns the short maneuver -- duck-coast-THROUGH a passable bar or BRAKE
+# before an impossible one. Mirrors the crossing-chain jumping filter: never
+# learns to walk. ReachAvoidPPO + REST objective with a per-row obstacle window
+# (passable: past-bar rest; impossible: pre-bar rest); bar-height curriculum.
 register_mjlab_task(
   task_id="Unitree-Go2-Crawl",
   env_cfg=unitree_go2_crawl_env_cfg(),
   play_env_cfg=unitree_go2_crawl_env_cfg(play=True),
   rl_cfg=unitree_go2_crawl_ppo_runner_cfg(),
-  runner_cls=ParkourReachAvoidOnPolicyRunner,
+  runner_cls=ParkourReachRestOnPolicyRunner,
 )
 
 # Crawl ISAACS increment 0: + sustained RANDOM push curriculum (5 N steps to
@@ -194,7 +193,7 @@ register_mjlab_task(
   env_cfg=unitree_go2_crawl_adv_env_cfg(),
   play_env_cfg=unitree_go2_crawl_adv_env_cfg(play=True),
   rl_cfg=unitree_go2_crawl_ppo_runner_cfg(),
-  runner_cls=ParkourReachAvoidOnPolicyRunner,
+  runner_cls=ParkourReachRestOnPolicyRunner,
 )
 
 # Crawl ISAACS increments 1-2: two-player adversarial reach-avoid + league.

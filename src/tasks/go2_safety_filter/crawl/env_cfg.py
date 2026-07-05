@@ -1,40 +1,38 @@
-"""Crawl-filter task: keep moving forward under a bar, ducking as low as it
-takes — or STOP if the bar is below the crouch feasibility floor.
+"""Crawl safety FILTER (skill 2), momentum-reactive — mirrors the crossing-chain
+jumping filter (see chat 2026-07-05).
 
-Strategy (v2, height curriculum — see chat 2026-07-04): the crawl skill is
-acquired CONTINUOUSLY, never as a rare exploration win.  The terrain starts
-with a bar high enough that the standing/walking Go2 passes untouched
-(row 0 = 0.50 m clearance), and a forward curriculum lowers it one small notch
-at a time; each notch demands only a slightly deeper duck than the last, so
-ducking emerges as a smooth extension of walking.  Below the feasibility floor
-(~0.22 m) the bar is impossible and the correct behavior is to stop.
+Deployment model (identical to the gap line): a nominal walker drives the robot
+forward; near a bar the crawl filter takes over and executes a SHORT maneuver —
+duck-and-coast THROUGH a passable bar, or BRAKE to a stop before an impossible
+one — then hands back.  The filter never learns to walk: it is spawned into the
+takeover distribution (arrival momentum / real mid-gait walker states) and
+learns to react.  This is why the gap line never trained locomotion — landing
+spawned mid-air, crossing-chain spawned with arrival momentum, and the HANDOVER
+stratum replays real go2_velocity walker states.
 
-Reach-avoid objective (COMMAND / velocity-liveness mode, NOT the jumping
-line's rest mode):
-    g (avoid)  = min(base-height, orientation, no-nonfoot-contact)  — don't
-                 fall / tip / strike the bar
-    l (reach)  = forward-speed liveness (>= a fraction of the commanded vx)
-Under a passable bar the robot keeps forward speed by ducking (l>=0, g>=0 ->
-V>0); under an impossible one, keeping speed means striking, so the only way
-to hold g>=0 is to stop -> l<0 -> V<0.  The value function is negative exactly
-on the impassable bars — the stop-vs-go signal the deployment filter reads.
-(Rest mode collapsed to stop-always here: the Go2 can brake out of almost any
-approach, so "reach safe rest" was satisfiable everywhere.)
+Reach objective: rest mode (l = come to a safe stop) + a per-row obstacle
+window (``env._rest_obstacle_window_w``, read by the reach-avoid wrapper):
+  * PASSABLE bar -> only rest PAST the bar counts (must duck-coast-through);
+  * IMPOSSIBLE bar -> rest BEFORE the bar counts (must stop).
 
-Deployment: the crawl policy is the safety backup while a bar is overhead;
-once the robot is clear, the nominal task policy takes over.
+Terrain height curriculum (start on a bar the robot coasts under upright,
+0.50 m, lower a notch on each crossing): the duck emerges continuously as the
+bars descend, seeded by MID-BAR spawns (under the beam, coasting out) exactly
+as the gap line's mid-air stratum seeded the landing.
 
-Perception: two forward raycast fans (bar_scan up ~17deg, bar_scan_low near
-horizontal) on the actor+critic; privileged analytic [dist, clearance] on the
-critic only. The down-looking terrain_scan is blind to overhead bars.
+Strata by row feasibility (an upright coast clears clearance >= 0.42):
+  PASSABLE:   MUST-CROSS (duck-coast-through, reverse curriculum from the exit)
+              + MID-BAR (under the beam, coasting out) + HANDOVER (walker states)
+  IMPOSSIBLE: STOPPABLE (brake before) + DOOMED (unstoppable -> teaches V<0)
+              + HANDOVER
 """
 
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 
 import torch
-from dataclasses import replace
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
@@ -50,44 +48,74 @@ from src.isaacs_go2.crawl_filter_terrain import (
   CRAWL_FILTER_TERRAINS_CFG,
   _BAR_X,
   bar_clearance_for_level,
+  is_impossible_level,
+)
+from src.tasks.go2_safety_filter.crossing_chain.env_cfg import (
+  _handover_data,
+  apply_handover_joints,
+  phase_random_offset,
 )
 
-# Spawn geometry.
-_NOSE = 0.35        # body reach ahead of base center
-_APPROACH_MIN = 0.3  # nose-distance to the bar face, near end
-_APPROACH_MAX = 2.2  # nose-distance to the bar face, far end (approach is 2.5)
+# --- momentum-reactive constants (mirror crossing_chain) ----------------------
+_A_BRAKE = 3.0
+_VX_CAP = 3.4
+_NOSE = 0.35
+_UPRIGHT_FIT = 0.42          # clearance an upright coast clears (trunk top ~0.38)
+_CROSS_LEVELS = 5
+_HANDOVER_LEVELS = 5
 
+# Crouch joint poses (thigh, calf) and their standing-equilibrium base height,
+# interpolated by alpha = clamp((0.30 - clearance)/0.08, 0, 1). Spawn z is set
+# to the equilibrium (feet-borne) so the crouch doesn't penetrate the ground and
+# eject the robot into the contact margin (the v1 spawn-transient bug).
+_CROUCH_SHALLOW = (1.2, -2.3)   # base ~0.19
+_CROUCH_DEEP = (1.35, -2.55)    # base ~0.15
+_EQ_Z_SHALLOW = 0.166
+_EQ_Z_DEEP = 0.146
 
-_FRAC_BEYOND = 0.25  # spawned PAST the bar (far-side value seed)
-_FRAC_UNDER = 0.30   # spawned UNDER the bar (traversal-value seed, hi bars only)
-_UPRIGHT_FIT_CLEARANCE = 0.42  # min clearance an upright Go2 clears (~0.38 tall)
+# Spawn strata fractions (passable rows).
+_FRAC_MUSTCROSS = 0.45
+_FRAC_MIDBAR = 0.25
+# remainder 0.30 = handover replay
+# Impossible rows: STOPPABLE 0.5 / DOOMED 0.2 / HANDOVER 0.3.
 
 
 def _ensure_crawl_buffers(env):
-  if not hasattr(env, "_crawl_started_before"):
-    env._crawl_started_before = torch.ones(
-      env.num_envs, dtype=torch.bool, device=env.device)
+  if not hasattr(env, "_cross_level"):
+    n, dev = env.num_envs, env.device
+    env._cross_level = torch.zeros(n, dtype=torch.long, device=dev)
+    env._was_mustcross = torch.zeros(n, dtype=torch.bool, device=dev)
+    env._crouch_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+    env._crouch_alpha = torch.zeros(n, device=dev)
+    env._handover_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+    env._handover_jpos = torch.zeros(n, 12, device=dev)
+    env._handover_jvel = torch.zeros(n, 12, device=dev)
+    env._handover_level = torch.zeros(n, dtype=torch.long, device=dev)
+    env._rest_obstacle_window_w = torch.zeros(n, 2, device=dev)
 
 
-def reset_crawl_approach(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
-  """Spawn upright facing the bar with forward momentum, in three bands that
-  seed a connected value chain approach -> under -> past (a fresh policy else
-  stops dead at the bar: it reads "beam ahead", stopping is safe, and the
-  approach l is already maxed, so nothing pulls it through):
+def set_rest_obstacle_window(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
+  """Per-row rest window: PASSABLE -> exclude the whole approach (only past-bar
+  rest counts -> must cross); IMPOSSIBLE -> target rest before the bar (stop)."""
+  if env_ids is None:
+    env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
+  if len(env_ids) == 0:
+    return
+  _ensure_crawl_buffers(env)
+  impossible = is_impossible_level(env.scene.terrain.terrain_levels[env_ids])
+  ox = env.scene.env_origins[env_ids, 0]
+  lo = torch.where(impossible, ox + _BAR_X - 0.35, ox - 100.0)
+  env._rest_obstacle_window_w[env_ids, 0] = lo
+  env._rest_obstacle_window_w[env_ids, 1] = ox + _BAR_X + BAR_DEPTH + 0.40
 
-  * APPROACH (45%): nose-distance d in front of the bar face (varied
-    dist/speed for the full decision band).
-  * UNDER (30%): directly under the beam, walking out — seeds the value of
-    BEING under the bar (leads to the high-value rest zone), which is what
-    pulls approach robots through. ONLY where an upright robot fits under the
-    beam (clearance >= 0.42, i.e. the high bars the curriculum starts on);
-    at lower bars these fall back to APPROACH (no crouched spawns -> no
-    spawn-transient strikes).
-  * BEYOND (25%): already past the bar exit (rest zone) — seeds "keep walking
-    past the bar".
 
-  Only APPROACH spawns are tagged started_before, so only a genuine
-  before->past crossing promotes the terrain curriculum."""
+def _crouch_z(alpha):
+  return _EQ_Z_SHALLOW + (_EQ_Z_DEEP - _EQ_Z_SHALLOW) * alpha
+
+
+def reset_takeover_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot"),
+                         stop_margin: float = 0.0):
+  """Takeover-distribution spawn, stratified by row feasibility."""
   if env_ids is None:
     env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
   if len(env_ids) == 0:
@@ -101,90 +129,217 @@ def reset_crawl_approach(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
   def u(lo, hi):
     return sample_uniform(lo, hi, (n,), device)
 
-  clearance = bar_clearance_for_level(env.scene.terrain.terrain_levels[env_ids])
-  upright_fits = clearance >= _UPRIGHT_FIT_CLEARANCE
-  r = u(0.0, 1.0)
-  beyond = r < _FRAC_BEYOND
-  under = (r >= _FRAC_BEYOND) & (r < _FRAC_BEYOND + _FRAC_UNDER) & upright_fits
-  approach = ~beyond & ~under
-  env._crawl_started_before[env_ids] = approach
+  terrain = env.scene.terrain
+  levels = terrain.terrain_levels[env_ids]
+  clearance = bar_clearance_for_level(levels)
+  impossible = is_impossible_level(levels)
+  upright_fits = clearance >= _UPRIGHT_FIT
+  alpha = ((0.30 - clearance) / 0.08).clamp(0.0, 1.0)  # crouch depth for this bar
+  hdata = _handover_data(device)
 
-  d = u(_APPROACH_MIN, _APPROACH_MAX)                 # nose-distance to bar face
-  x_approach = (_BAR_X - _NOSE - d).clamp(min=0.15)
-  x_under = (_BAR_X - 0.1) + u(0.0, BAR_DEPTH + 0.1)  # under the beam
-  x_beyond = (_BAR_X + BAR_DEPTH) + u(0.1, 2.5)       # rest zone, past exit
-  x = torch.where(beyond, x_beyond, torch.where(under, x_under, x_approach))
-  pose = torch.stack(
-    [x, u(-0.06, 0.06), u(-0.02, 0.02),
-     u(-0.05, 0.05), u(-0.05, 0.05), u(-0.06, 0.06)], dim=1)
-  vx = u(0.3, 1.8)
+  r = u(0.0, 1.0)
+  # Passable-row strata.
+  mustcross = (~impossible) & (r < _FRAC_MUSTCROSS)
+  midbar = (~impossible) & (r >= _FRAC_MUSTCROSS) & (r < _FRAC_MUSTCROSS + _FRAC_MIDBAR)
+  p_handover = (~impossible) & (r >= _FRAC_MUSTCROSS + _FRAC_MIDBAR)
+  # Impossible-row strata.
+  stoppable = impossible & (r < 0.5)
+  doomed = impossible & (r >= 0.5) & (r < 0.7)
+  i_handover = impossible & (r >= 0.7)
+  handover = p_handover | i_handover
+  if hdata is None:                      # fold handover into brake/cross
+    mustcross = mustcross | p_handover
+    stoppable = stoppable | i_handover
+    handover = torch.zeros_like(handover)
+
+  env._was_mustcross[env_ids] = mustcross
+  env._handover_mask[env_ids] = handover
+  crouch = torch.zeros(n, dtype=torch.bool, device=device)
+
+  # --- defaults (z is ABSOLUTE base height) ---
+  d = u(0.3, 2.2)                        # nose-distance to the bar face
+  vx = u(0.0, 1.5)
+  x = (_BAR_X - _NOSE - d).clamp(min=0.15)
+  z_abs = 0.32 + u(-0.01, 0.03)          # near standing height
+  vz = u(-0.05, 0.05)
+
+  # --- STOPPABLE (impossible rows): brakeable arrival -> brake before bar ---
+  d_s = u(0.5, 2.2)
+  v_brake = torch.sqrt(2.0 * _A_BRAKE * (d_s - stop_margin).clamp_min(0.05))
+  vx = torch.where(stoppable, (v_brake * u(0.15, 0.9)).clamp(0.0, _VX_CAP), vx)
+  x = torch.where(stoppable, (_BAR_X - _NOSE - d_s).clamp(min=0.15), x)
+
+  # --- DOOMED (impossible rows): unstoppable -> can't win, teaches V<0 ---
+  vx_dm = u(2.6, _VX_CAP)
+  d_dm = u(0.1, 0.6)
+  vx = torch.where(doomed, vx_dm, vx)
+  x = torch.where(doomed, (_BAR_X - _NOSE - d_dm).clamp(min=0.15), x)
+
+  # --- MUST-CROSS (passable): reverse curriculum from the exit ---
+  # assist=1 -> spawn AT the bar exit, ducked, coasting out (trivial settle);
+  # assist->0 -> spawn approaching with momentum (must duck-coast-through).
+  assist = (1.0 - env._cross_level[env_ids].float() / _CROSS_LEVELS).clamp(0, 1)
+  at_exit = mustcross & (u(0.0, 1.0) < assist)
+  approach = mustcross & ~at_exit
+  # approaching share: fast enough it must cross (unstoppable), varied distance
+  d_mc = u(0.3, 1.4)
+  vx_mc = torch.maximum(u(1.4, 2.6), torch.sqrt(2.0 * _A_BRAKE * d_mc) * 1.1)
+  vx_mc = vx_mc.clamp(0.8, _VX_CAP)
+  x = torch.where(approach, (_BAR_X - _NOSE - d_mc).clamp(min=0.15), x)
+  vx = torch.where(approach, vx_mc, vx)
+  # at-exit share: just past the bar exit, moving out slowly
+  x = torch.where(at_exit, _BAR_X + BAR_DEPTH + u(0.0, 0.4), x)
+  vx = torch.where(at_exit, u(0.6, 1.4), vx)
+
+  # --- MID-BAR (passable): under the beam, ducked, coasting out ---
+  x = torch.where(midbar, _BAR_X + u(0.0, BAR_DEPTH), x)
+  vx = torch.where(midbar, u(0.8, 1.8), vx)
+
+  # crouch ONLY the spawns that are UNDER the beam under a LOW bar (midbar and
+  # the at-exit share): they'd strike upright. Approaching robots stay upright
+  # and must duck DYNAMICALLY as they reach the bar (the learned skill); the
+  # exit share under a HIGH bar also fits upright. Crouched spawns sit at the
+  # crouch standing-equilibrium so they don't penetrate and eject.
+  needs_low = ~upright_fits
+  crouch = (midbar | at_exit) & needs_low
+  env._crouch_mask[env_ids] = crouch
+  env._crouch_alpha[env_ids] = alpha
+  z_abs = torch.where(crouch, _crouch_z(alpha) + u(0.005, 0.02), z_abs)
+
+  pose_xy = torch.stack([x, u(-0.06, 0.06)], dim=1)
+  euler = torch.stack([u(-0.05, 0.05), u(-0.05, 0.05), u(-0.06, 0.06)], dim=1)
   velocities = root[:, 7:13] + torch.stack(
-    [vx, u(-0.10, 0.10), u(-0.05, 0.05),
-     u(-0.10, 0.10), u(-0.10, 0.10), u(-0.10, 0.10)], dim=1)
-  positions = root[:, 0:3] + pose[:, 0:3] + env.scene.env_origins[env_ids]
+    [vx, u(-0.10, 0.10), vz, u(-0.10, 0.10), u(-0.10, 0.10), u(-0.10, 0.10)], dim=1)
+  origins = env.scene.env_origins[env_ids]
+  positions = torch.empty(n, 3, device=device)
+  positions[:, 0:2] = root[:, 0:2] + pose_xy + origins[:, 0:2]
+  positions[:, 2] = z_abs + origins[:, 2]
   orientations = quat_mul(
-    root[:, 3:7], quat_from_euler_xyz(pose[:, 3], pose[:, 4], pose[:, 5]))
+    root[:, 3:7], quat_from_euler_xyz(euler[:, 0], euler[:, 1], euler[:, 2]))
+
+  # --- HANDOVER replay: real mid-gait walker states on the approach ---
+  if hdata is not None and bool(handover.any()):
+    h_idx = handover.nonzero().flatten()
+    lvl = env._handover_level[env_ids][h_idx].float()
+    n_rows = len(hdata["z"])
+    lo_f = 0.15 * lvl
+    hi_f = (lo_f + 0.30).clamp(max=1.0)
+    frac = torch.rand(len(h_idx), device=device)
+    rows = ((lo_f + frac * (hi_f - lo_f)) * (n_rows - 1)).long()
+    ease = (1.0 - lvl / _HANDOVER_LEVELS)
+    d_lo = 0.25 + ease * 0.75
+    d_hi = 0.60 + ease * 1.15
+    d_h = d_lo + torch.rand(len(h_idx), device=device) * (d_hi - d_lo)
+    ox = env.scene.env_origins[env_ids][h_idx]
+    positions[h_idx, 0] = ox[:, 0] + _BAR_X - _NOSE - d_h
+    positions[h_idx, 1] = ox[:, 1] + sample_uniform(-0.06, 0.06, (len(h_idx),), device)
+    positions[h_idx, 2] = hdata["z"][rows]
+    orientations[h_idx] = hdata["quat"][rows]
+    velocities[h_idx, 0:3] = hdata["lin_vel_w"][rows]
+    velocities[h_idx, 3:6] = hdata["ang_vel_w"][rows]
+    env._handover_jpos[env_ids[h_idx]] = hdata["joint_pos"][rows]
+    env._handover_jvel[env_ids[h_idx]] = hdata["joint_vel"][rows]
+    env._crouch_mask[env_ids[h_idx]] = False  # walker states are upright
+
   asset.write_root_link_pose_to_sim(
     torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
   asset.write_root_link_velocity_to_sim(velocities, env_ids=env_ids)
 
 
-def crawl_height_levels(env, env_ids) -> torch.Tensor | None:
-  """Forward height curriculum, bar-relative (robust to the varied spawn x):
-  promote when the robot got THROUGH the bar and kept going (>1 m past exit),
-  demote when it ended short of the bar (stopped / never reached it).  Read
-  at reset time, before respawn, so the position is the episode's final one.
+def apply_crouch_joints(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
+  """Write the clearance-matched crouch pose (after reset_robot_joints).
+  Zero joint velocity + tight noise: crouch spawns are transient-fragile."""
+  if env_ids is None:
+    env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
+  if len(env_ids) == 0 or not hasattr(env, "_crouch_mask"):
+    return
+  mask = env._crouch_mask[env_ids]
+  if not bool(mask.any()):
+    return
+  asset = env.scene[asset_cfg.name]
+  ids = env_ids[mask.nonzero().flatten()]
+  m = int(len(ids))
+  alpha = env._crouch_alpha[ids].unsqueeze(-1)
+  jpos = asset.data.default_joint_pos[ids].clone()
+  thigh = _CROUCH_SHALLOW[0] + (_CROUCH_DEEP[0] - _CROUCH_SHALLOW[0]) * alpha
+  calf = _CROUCH_SHALLOW[1] + (_CROUCH_DEEP[1] - _CROUCH_SHALLOW[1]) * alpha
+  for leg in range(4):
+    jpos[:, 3 * leg + 1] = thigh.squeeze(-1)
+    jpos[:, 3 * leg + 2] = calf.squeeze(-1)
+  jpos += sample_uniform(-0.02, 0.02, (m, 12), env.device)
+  asset.write_joint_state_to_sim(jpos, torch.zeros_like(jpos), env_ids=ids)
 
-  On impossible rows the robot stops before the bar -> demote, so the
-  population settles at the feasibility frontier and the impossible rows are
-  visited transiently (enough for V<0 to form there)."""
+
+# --- curricula (run at reset, before reset events; read ended-episode state) --
+
+def _crossed_bar(env, env_ids):
+  x = (env.scene["robot"].data.root_link_pos_w[env_ids, 0]
+       - env.scene.env_origins[env_ids, 0])
+  return (x > (_BAR_X + BAR_DEPTH)) & (x < 20.0)  # past exit, guard stale reads
+
+
+def cross_assist_levels(env, env_ids) -> torch.Tensor:
+  """Reverse curriculum on the MUST-CROSS maneuver: crossed past the bar and
+  settled (timeout) -> promote (less exit assist, spawn approaching); fall ->
+  demote."""
+  _ensure_crawl_buffers(env)
+  was = env._was_mustcross[env_ids]
+  t_o = env.termination_manager.time_outs[env_ids]
+  crossed = _crossed_bar(env, env_ids)
+  lvl = env._cross_level[env_ids]
+  lvl = torch.where(was & t_o & crossed, lvl + 1, lvl)
+  lvl = torch.where(was & ~t_o, lvl - 1, lvl)
+  env._cross_level[env_ids] = lvl.clamp(0, _CROSS_LEVELS)
+  return env._cross_level.float().mean()
+
+
+def handover_levels_crawl(env, env_ids) -> torch.Tensor:
+  _ensure_crawl_buffers(env)
+  was = env._handover_mask[env_ids]
+  t_o = env.termination_manager.time_outs[env_ids]
+  lvl = env._handover_level[env_ids]
+  lvl = torch.where(was & t_o, lvl + 1, lvl)
+  lvl = torch.where(was & ~t_o, lvl - 1, lvl)
+  env._handover_level[env_ids] = lvl.clamp(0, _HANDOVER_LEVELS)
+  return env._handover_level.float().mean()
+
+
+def crawl_height_levels(env, env_ids) -> torch.Tensor | None:
+  """Terrain (bar-height) curriculum gated on the binding skill: promote only
+  when a MUST-CROSS env crossed and settled; demote on falls. On impossible
+  rows _was_mustcross never fires -> they only demote on falls, so learning to
+  stop there isn't misread as crawl mastery."""
   terrain = env.scene.terrain
   if terrain is None or not hasattr(terrain, "update_env_origins"):
     return None
   _ensure_crawl_buffers(env)
-  x_rel = (env.scene["robot"].data.root_link_pos_w[env_ids, 0]
-           - env.scene.env_origins[env_ids, 0])
-  # Guard the first reset (robot world position is stale/off-patch before the
-  # reset event places it -> x_rel ~ inter-patch spacing): only trust readings
-  # inside the 12 m patch.
-  in_patch = (x_rel > -1.0) & (x_rel < 11.0)
-  # Promote ONLY envs that started before the bar and finished past it (beyond-
-  # spawns start past the bar and would promote spuriously).
-  started_before = env._crawl_started_before[env_ids]
-  move_up = in_patch & started_before & (x_rel > (_BAR_X + BAR_DEPTH + 1.0))
-  move_down = in_patch & started_before & (x_rel < (_BAR_X - 0.3))
-  terrain.update_env_origins(env_ids, move_up, move_down & ~move_up)
+  t_o = env.termination_manager.time_outs[env_ids]
+  was = env._was_mustcross[env_ids]
+  crossed = _crossed_bar(env, env_ids)
+  terrain.update_env_origins(env_ids, was & t_o & crossed, ~t_o)
   return terrain.terrain_levels.float().mean()
 
 
 def pinned_levels_crawl(env, env_ids) -> torch.Tensor:
-  """Adversarial phases: pin the terrain rows the ctrl policy mastered so the
-  survival-gated curriculum can't demote under adversarial pressure."""
-  return env.scene.terrain.terrain_levels.float().mean()
+  _ensure_crawl_buffers(env)
+  env._cross_level[env_ids] = 4
+  env._handover_level[env_ids] = 3
+  return env._cross_level.float().mean()
 
 
 # --- perception ---------------------------------------------------------------
 
 def _add_bar_perception(cfg: ManagerBasedRlEnvCfg) -> None:
-  """Forward/up raycast fans (actor+critic) + analytic bar info (critic)."""
   bar_scan = RayCastSensorCfg(
-    name="bar_scan",
-    frame=ObjRef(type="body", name="base_link", entity="robot"),
+    name="bar_scan", frame=ObjRef(type="body", name="base_link", entity="robot"),
     ray_alignment="yaw",
-    pattern=GridPatternCfg(size=(0.0, 0.6), resolution=0.1,
-                           direction=(1.0, 0.0, 0.3)),
-    max_distance=4.0,
-    exclude_parent_body=True,
-  )
+    pattern=GridPatternCfg(size=(0.0, 0.6), resolution=0.1, direction=(1.0, 0.0, 0.3)),
+    max_distance=4.0, exclude_parent_body=True)
   bar_scan_low = RayCastSensorCfg(
-    name="bar_scan_low",
-    frame=ObjRef(type="body", name="base_link", entity="robot"),
+    name="bar_scan_low", frame=ObjRef(type="body", name="base_link", entity="robot"),
     ray_alignment="yaw",
-    pattern=GridPatternCfg(size=(0.0, 0.6), resolution=0.1,
-                           direction=(1.0, 0.0, 0.05)),
-    max_distance=4.0,
-    exclude_parent_body=True,
-  )
+    pattern=GridPatternCfg(size=(0.0, 0.6), resolution=0.1, direction=(1.0, 0.0, 0.05)),
+    max_distance=4.0, exclude_parent_body=True)
   cfg.scene.sensors = tuple(cfg.scene.sensors or ()) + (bar_scan, bar_scan_low)
   for name in ("bar_scan", "bar_scan_low"):
     cfg.observations["proprioception"].terms[name] = ObservationTermCfg(
@@ -204,40 +359,38 @@ def unitree_go2_crawl_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   cfg = unitree_go2_gap_reach_avoid_env_cfg(play=play)
   cfg.scene.terrain.terrain_generator = replace(CRAWL_FILTER_TERRAINS_CFG)
-  # Forward curriculum: every env starts at the highest (trivial) bar.
-  cfg.scene.terrain.max_init_terrain_level = 0
-  cfg.episode_length_s = 6.0
-
-  # Side-profile follow camera (azimuth 90 = robot moving L->R into the bar on
-  # the right): the crouch depth is directly legible in profile. The bar spans
-  # the full width, so a side view looks THROUGH it when the robot is under —
-  # only works because the beam/wall are now semi-transparent (verified: robot
-  # stays fully visible under the bar). A rear view (azimuth 180) renders the
-  # robot off-frame; azimuth 0/90/270 all show it, 90 gives natural motion.
-  cfg.viewer.body_name = "base_link"
-  cfg.viewer.distance = 3.3
-  cfg.viewer.elevation = -14.0
-  cfg.viewer.azimuth = 90.0
+  cfg.scene.terrain.max_init_terrain_level = 0     # start on the highest bar
+  cfg.episode_length_s = 8.0
 
   _add_bar_perception(cfg)
 
-  # Ground approach spawn with forward momentum (no midair gap reset).
-  cfg.events["reset_base"] = EventTermCfg(
-    func=reset_crawl_approach, mode="reset", params={})
+  cfg.events["reset_base"] = EventTermCfg(func=reset_takeover_crawl, mode="reset", params={})
   cfg.events["reset_robot_joints"].params["position_range"] = (-0.1, 0.1)
   cfg.events["reset_robot_joints"].params["velocity_range"] = (-0.1, 0.1)
-  # The parkour base re-rolls terrain each reset in play mode; it breaks the
-  # height curriculum (and row pinning in evals) — drop it.
+  cfg.events["crouch_joints"] = EventTermCfg(func=apply_crouch_joints, mode="reset", params={})
+  cfg.events["handover_joints"] = EventTermCfg(func=apply_handover_joints, mode="reset", params={})
+  cfg.events["rest_obstacle_window"] = EventTermCfg(func=set_rest_obstacle_window, mode="reset", params={})
+  cfg.events.pop("push_robot", None)
   cfg.events.pop("randomize_terrain", None)
+
+  # Phase-offset-invariant gait clock (deployment handovers at arbitrary phase).
+  for gname in ("proprioception", "critic"):
+    term = copy.deepcopy(cfg.observations[gname].terms["phase"])
+    period = float(term.params.get("period", 0.5))
+    term.func = phase_random_offset
+    term.params = {"period": period}
+    cfg.observations[gname].terms["phase"] = term
 
   cfg.curriculum = {
     "terrain_levels": CurriculumTermCfg(func=crawl_height_levels),
+    "cross_assist": CurriculumTermCfg(func=cross_assist_levels),
+    "handover_level": CurriculumTermCfg(func=handover_levels_crawl),
   }
   return cfg
 
 
 def unitree_go2_crawl_isaacs_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg = unitree_go2_crawl_env_cfg(play=play)
-  # Adversarial phases pin the mastered rows (no promote/demote treadmill).
+  cfg.events["reset_base"].params["stop_margin"] = 0.3
   cfg.curriculum = {"pinned_levels": CurriculumTermCfg(func=pinned_levels_crawl)}
   return cfg
