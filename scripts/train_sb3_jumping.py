@@ -20,6 +20,7 @@ env (mjlab + stable_baselines3; safety_sb3 on sys.path), MUJOCO_GL=egl.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 
@@ -48,7 +49,7 @@ def main():
   p.add_argument("--steps", type=int, default=8_000_000)
   p.add_argument("--n-steps", type=int, default=48)
   p.add_argument("--batch-size", type=int, default=16384)
-  p.add_argument("--lr", type=float, default=3e-4)
+  p.add_argument("--lr", type=float, default=5e-4)
   p.add_argument("--force-max", type=float, default=50.0)
   p.add_argument("--load", default=None, help="warm-start checkpoint (.zip)")
   p.add_argument("--device", default="cuda:0")
@@ -56,10 +57,15 @@ def main():
   args = p.parse_args()
 
   tag = args.tag or f"sb3_{args.stage}{'_isaacs' if args.adversary else ''}"
+  # rsl_rl-parity recipe (the config that reached ep_len 135 on landing):
+  #   obs normalization (both nets), low entropy 1e-4, init action std 0.3
+  #   (log_std_init=ln 0.3), KL-adaptive LR (desired_kl 0.01, lr 5e-4).
+  policy_kwargs = dict(log_std_init=math.log(0.3), **_NET)
   common = dict(gamma=0.99, gae_lambda=0.95, learning_rate=args.lr,
-                ent_coef=0.005, clip_range=0.2, max_grad_norm=1.0, n_epochs=5,
+                ent_coef=1e-4, clip_range=0.2, max_grad_norm=1.0, n_epochs=5,
                 n_steps=args.n_steps, batch_size=args.batch_size,
-                policy_kwargs=_NET, verbose=1, device=args.device,
+                normalize_obs=True, adaptive_lr=True, desired_kl=0.01,
+                policy_kwargs=policy_kwargs, verbose=1, device=args.device,
                 tensorboard_log=os.path.join(_REPO, "runs_sb3", tag))
 
   if args.stage == "landing":
@@ -81,15 +87,27 @@ def main():
       Algo, akw = ReachAvoidPPO, {}
 
   if args.load:
-    model = Algo.load(args.load, env=env, device=args.device)
+    # Restore the prior stage's obs-normalization stats onto this env, then
+    # load the policy (SB3 VecNormalize stats live outside the .zip).
+    from stable_baselines3.common.vec_env import VecNormalize
+    vn_path = args.load.replace("final_model.zip", "vecnormalize.pkl")
+    if os.path.exists(vn_path):
+      env = VecNormalize.load(vn_path, env)
+      env.training = True
+      common = {k: v for k, v in common.items() if k != "normalize_obs"}
+    model = Algo("MlpPolicy", env, **akw, **common)
+    model.set_parameters(args.load, device=args.device)
     print(f"[warm-start] loaded {args.load}")
   else:
     model = Algo("MlpPolicy", env, **akw, **common)
 
   model.learn(total_timesteps=args.steps, progress_bar=False)
-  out = os.path.join(_REPO, "runs_sb3", tag, "final_model.zip")
-  model.save(out)
-  print(f"[done] saved {out}")
+  outdir = os.path.join(_REPO, "runs_sb3", tag)
+  model.save(os.path.join(outdir, "final_model.zip"))
+  vn = model.get_vec_normalize_env()
+  if vn is not None:
+    vn.save(os.path.join(outdir, "vecnormalize.pkl"))
+  print(f"[done] saved {outdir}/final_model.zip (+ vecnormalize)")
 
 
 if __name__ == "__main__":
