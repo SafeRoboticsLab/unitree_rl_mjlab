@@ -161,7 +161,11 @@ class Go2ParkourIsaacsVecEnv(VecEnv, _ForceMixin):
     obs_dict, _ = self.mj.reset()
     obs0 = self._obs(obs_dict)
     obs_space = spaces.Box(-np.inf, np.inf, shape=(obs0.shape[1],), dtype=np.float32)
-    act_space = spaces.Box(-1.0, 1.0, shape=(CTRL_DIM + DSTB_DIM,), dtype=np.float32)
+    # Single-agent (adversary off) exposes a ctrl-only action space; the
+    # two-player ISAACS action appends the DSTB force dims. step_wait reads
+    # a[:, :CTRL_DIM] for ctrl and only touches a[:, CTRL_DIM:] when adversary.
+    act_dim = CTRL_DIM + (DSTB_DIM if self.adversary else 0)
+    act_space = spaces.Box(-1.0, 1.0, shape=(act_dim,), dtype=np.float32)
     super().__init__(int(num_envs), obs_space, act_space)
     self._actions = None
 
