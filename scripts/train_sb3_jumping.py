@@ -28,8 +28,34 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
 sys.path.insert(0, "/home/buzi/Desktop/RESEARCH/SAFE/DEVELOPMENT/safety-stable-baselines")
 
-from stable_baselines3.common.callbacks import CheckpointCallback  # noqa: E402
+from stable_baselines3.common.callbacks import (  # noqa: E402
+  BaseCallback,
+  CallbackList,
+  CheckpointCallback,
+)
 from stable_baselines3.common.vec_env import VecMonitor  # noqa: E402
+
+
+class ForceRampCallback(BaseCallback):
+  """Ramp the adversary's force magnitude from weak to force_max over training,
+  so the ctrl policy adapts to a strengthening attacker instead of collapsing
+  under full 50 N from step one (the ISAACS treadmill: ep_len 192 -> 20)."""
+
+  def __init__(self, force_max, ramp_steps, force_start=8.0):
+    super().__init__()
+    self.fmax, self.ramp, self.fstart = force_max, ramp_steps, force_start
+    self._bridge = None
+
+  def _on_training_start(self):
+    e = self.model.env
+    while hasattr(e, "venv"):
+      e = e.venv
+    self._bridge = e
+
+  def _on_step(self):
+    frac = min(1.0, self.num_timesteps / max(1, self.ramp))
+    self._bridge.force_max = self.fstart + (self.fmax - self.fstart) * frac
+    return True
 
 from safety_sb3 import IsaacsPPO, ReachAvoidPPO, SafetyPPO  # noqa: E402
 from src.isaacs_go2.go2_parkour_isaacs import (  # noqa: E402
@@ -123,7 +149,12 @@ def main():
     save_freq=max(1, 2_000_000 // args.num_envs),
     save_path=os.path.join(_REPO, "runs_sb3", tag, "checkpoints"),
     name_prefix="model", save_vecnormalize=True)
-  model.learn(total_timesteps=args.steps, progress_bar=False, callback=ckpt_cb)
+  cbs = [ckpt_cb]
+  if args.stage == "chain" and args.adversary:
+    # force ramp to force_max over ~55% of training, then hold.
+    cbs.append(ForceRampCallback(args.force_max, int(0.55 * args.steps)))
+  model.learn(total_timesteps=args.steps, progress_bar=False,
+              callback=CallbackList(cbs))
   outdir = os.path.join(_REPO, "runs_sb3", tag)
   model.save(os.path.join(outdir, "final_model.zip"))
   vn = model.get_vec_normalize_env()

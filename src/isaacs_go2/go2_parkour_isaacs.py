@@ -368,10 +368,21 @@ def make_crossing_vecenv(num_envs=1024, device="cuda:0", **kw):
 
 def make_chain_vecenv(num_envs=1024, device="cuda:0", adversary=False, **kw):
   """Rest-objective crossing-chain (arrival momentum -> safe rest). ReachAvoid/
-  IsaacsPPO (adversary=True for the two-player game)."""
-  from src.tasks.go2_safety_filter.crossing_chain.env_cfg import (
-    unitree_go2_crossing_chain_env_cfg,
-  )
+  IsaacsPPO (adversary=True for the two-player game).
+
+  The adversary case uses the PINNED-curricula isaacs cfg (edge_margin 0.3 +
+  pinned_levels): under adversarial pressure the survival-gated curricula
+  otherwise demote and the game spirals into a treadmill / ctrl collapse
+  (observed on the base cfg: ep_len 192 -> 20). Pair with a force-magnitude
+  ramp (train-side) so the adversary strengthens gradually."""
+  if adversary:
+    from src.tasks.go2_safety_filter.crossing_chain.env_cfg import (
+      unitree_go2_crossing_chain_isaacs_env_cfg as cfg_builder,
+    )
+  else:
+    from src.tasks.go2_safety_filter.crossing_chain.env_cfg import (
+      unitree_go2_crossing_chain_env_cfg as cfg_builder,
+    )
   return Go2ParkourIsaacsVecEnv(
     num_envs=num_envs, device=device, adversary=adversary,
-    cfg_builder=unitree_go2_crossing_chain_env_cfg, margin_fn=rest_margins, **kw)
+    cfg_builder=cfg_builder, margin_fn=rest_margins, **kw)
