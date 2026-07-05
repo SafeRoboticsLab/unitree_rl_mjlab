@@ -49,6 +49,7 @@ from src.isaacs_go2.crawl_filter_terrain import (
   BAR_DEPTH,
   CRAWL_FILTER_TERRAINS_CFG,
   _BAR_X,
+  bar_clearance_for_level,
 )
 
 # Spawn geometry.
@@ -57,7 +58,9 @@ _APPROACH_MIN = 0.3  # nose-distance to the bar face, near end
 _APPROACH_MAX = 2.2  # nose-distance to the bar face, far end (approach is 2.5)
 
 
-_FRAC_BEYOND = 0.35  # fraction spawned PAST the bar (far-side value seed)
+_FRAC_BEYOND = 0.25  # spawned PAST the bar (far-side value seed)
+_FRAC_UNDER = 0.30   # spawned UNDER the bar (traversal-value seed, hi bars only)
+_UPRIGHT_FIT_CLEARANCE = 0.42  # min clearance an upright Go2 clears (~0.38 tall)
 
 
 def _ensure_crawl_buffers(env):
@@ -67,18 +70,24 @@ def _ensure_crawl_buffers(env):
 
 
 def reset_crawl_approach(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
-  """Spawn upright facing the bar with forward momentum.
+  """Spawn upright facing the bar with forward momentum, in three bands that
+  seed a connected value chain approach -> under -> past (a fresh policy else
+  stops dead at the bar: it reads "beam ahead", stopping is safe, and the
+  approach l is already maxed, so nothing pulls it through):
 
-  Two spawn bands:
-  * APPROACH (65%): nose-distance d in front of the bar face, varied
-    dist/speed so the value function sees the full decision band.
-  * BEYOND (35%): already PAST the bar exit (rest zone, always clear for an
-    upright robot at any bar height). This seeds the far side — without it a
-    fresh policy stops dead at the bar (it reads "beam ahead" and stopping is
-    safe; the approach l is already maxed so nothing pulls it through). With a
-    high-value "keep walking past the bar" region seeded, the reach-avoid
-    backup pulls the approach robots under and through. Beyond-spawns are
-    tagged so they don't spuriously promote the terrain curriculum."""
+  * APPROACH (45%): nose-distance d in front of the bar face (varied
+    dist/speed for the full decision band).
+  * UNDER (30%): directly under the beam, walking out — seeds the value of
+    BEING under the bar (leads to the high-value rest zone), which is what
+    pulls approach robots through. ONLY where an upright robot fits under the
+    beam (clearance >= 0.42, i.e. the high bars the curriculum starts on);
+    at lower bars these fall back to APPROACH (no crouched spawns -> no
+    spawn-transient strikes).
+  * BEYOND (25%): already past the bar exit (rest zone) — seeds "keep walking
+    past the bar".
+
+  Only APPROACH spawns are tagged started_before, so only a genuine
+  before->past crossing promotes the terrain curriculum."""
   if env_ids is None:
     env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
   if len(env_ids) == 0:
@@ -92,13 +101,19 @@ def reset_crawl_approach(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
   def u(lo, hi):
     return sample_uniform(lo, hi, (n,), device)
 
-  beyond = u(0.0, 1.0) < _FRAC_BEYOND
-  env._crawl_started_before[env_ids] = ~beyond
+  clearance = bar_clearance_for_level(env.scene.terrain.terrain_levels[env_ids])
+  upright_fits = clearance >= _UPRIGHT_FIT_CLEARANCE
+  r = u(0.0, 1.0)
+  beyond = r < _FRAC_BEYOND
+  under = (r >= _FRAC_BEYOND) & (r < _FRAC_BEYOND + _FRAC_UNDER) & upright_fits
+  approach = ~beyond & ~under
+  env._crawl_started_before[env_ids] = approach
 
   d = u(_APPROACH_MIN, _APPROACH_MAX)                 # nose-distance to bar face
   x_approach = (_BAR_X - _NOSE - d).clamp(min=0.15)
+  x_under = (_BAR_X - 0.1) + u(0.0, BAR_DEPTH + 0.1)  # under the beam
   x_beyond = (_BAR_X + BAR_DEPTH) + u(0.1, 2.5)       # rest zone, past exit
-  x = torch.where(beyond, x_beyond, x_approach)
+  x = torch.where(beyond, x_beyond, torch.where(under, x_under, x_approach))
   pose = torch.stack(
     [x, u(-0.06, 0.06), u(-0.02, 0.02),
      u(-0.05, 0.05), u(-0.05, 0.05), u(-0.06, 0.06)], dim=1)
