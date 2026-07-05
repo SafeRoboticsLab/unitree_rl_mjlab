@@ -183,7 +183,10 @@ def reset_takeover_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot"),
     handover = torch.zeros_like(handover)
 
   env._was_mustcrawl[env_ids] = mustcrawl
-  env._was_crawlwin[env_ids] = mustcrawl | midcrawl
+  # Assist ratchet driven by MID-CRAWL outcomes only: must-crawl approach
+  # spawns fail wholesale until the crawl exists, and their demotions swamp
+  # the easy-rung promotions (negative drift pins the level at 0).
+  env._was_crawlwin[env_ids] = midcrawl
   env._handover_mask[env_ids] = handover
   env._crouch_mask[env_ids] = False
 
@@ -232,7 +235,10 @@ def reset_takeover_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot"),
   # the bar forever: the l gradient points through the beam but standing
   # tall strikes it.
   easy = u(0.0, 1.0) < (0.15 + 0.85 * assist)
-  x_mid_hard = _BAR_X + BAR_DEPTH * u(0.0, 1.0)
+  # Hard rung graduates INSIDE the beam: low level -> spawn in the last
+  # quarter (rear clears after one step), high level -> anywhere under it.
+  depth_frac = 0.25 + 0.75 * (1.0 - assist)
+  x_mid_hard = _BAR_X + BAR_DEPTH * (1.0 - u(0.0, 1.0) * depth_frac)
   x_mid_easy = _BAR_X + BAR_DEPTH + u(0.4, 0.9)
   x = torch.where(midcrawl, torch.where(easy, x_mid_easy, x_mid_hard), x)
   # Spawn z must match the crouch-pose standing equilibrium (measured: 0.166 m
@@ -493,7 +499,7 @@ def unitree_go2_crawl_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # Absorbing target set: holding rest for 1 s ends the episode as a
   # bootstrapped time-out (success), not a failure.
   cfg.terminations["rested_in_target"] = TerminationTermCfg(
-    func=rested_in_target, params={"hold_steps": 50}, time_out=True)
+    func=rested_in_target, params={"hold_steps": 30}, time_out=True)
 
   # Phase-offset-invariant gait clock (same rationale as crossing_chain).
   import copy as _copy
