@@ -52,6 +52,8 @@ def main():
   p.add_argument("--batch-size", type=int, default=16384)
   p.add_argument("--lr", type=float, default=5e-4)
   p.add_argument("--force-max", type=float, default=50.0)
+  p.add_argument("--dstb-pretrain", type=int, default=20,
+                 help="dstb-pretrain ROLLOUTS (not rsl_rl iters); keep << total rollouts")
   p.add_argument("--load", default=None, help="warm-start checkpoint (.zip)")
   p.add_argument("--device", default="cuda:0")
   p.add_argument("--tag", default=None)
@@ -80,7 +82,12 @@ def main():
       args.num_envs, args.device, adversary=args.adversary, force_max=args.force_max))
     if args.adversary:
       Algo = IsaacsPPO
-      akw = dict(ctrl_action_dim=CTRL_DIM, dstb_pretrain_rollouts=400,
+      # Schedule is in ROLLOUTS (collect+update), NOT rsl_rl iterations. At
+      # n_envs*n_steps per rollout the whole run is only steps/(n_envs*n_steps)
+      # rollouts, so dstb_pretrain must be a small fraction (400 rollouts would
+      # never finish). ctrl warm-started -> short pretrain to bootstrap dstb.
+      akw = dict(ctrl_action_dim=CTRL_DIM,
+                 dstb_pretrain_rollouts=args.dstb_pretrain,
                  ctrl_rollouts_per_cycle=12, dstb_rollouts_per_cycle=3,
                  use_leaderboard=True,
                  leaderboard_dir=os.path.join(_REPO, "runs_sb3", tag, "leaderboard"))
