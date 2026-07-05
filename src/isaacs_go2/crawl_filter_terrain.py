@@ -40,9 +40,15 @@ BEAM_THICKNESS = 0.04
 WALL_HEIGHT = 0.6     # anti-jump wall stacked above the beam
 PILLAR_WIDTH = 0.05
 
-# Explicit clearance (bottom of beam) per difficulty row. Rows 8-9 are below
-# the Go2 crouch floor (~0.21-0.22) -> IMPOSSIBLE: correct behavior is to stop.
-ROW_CLEARANCES = (0.35, 0.33, 0.31, 0.29, 0.27, 0.25, 0.235, 0.22, 0.18, 0.15)
+# Explicit clearance (bottom of beam) per difficulty row, HIGH -> LOW so the
+# forward curriculum starts trivial: row 0 (0.50 m) clears the standing Go2
+# (trunk top ~0.38 m walking) untouched -> the walking behavior passes with no
+# new skill.  Rows descend one small notch at a time through the crouch
+# feasibility floor (~0.22 m) so ducking is acquired continuously, ending in
+# two IMPOSSIBLE rows below the floor (correct behavior there: STOP).
+ROW_CLEARANCES = (
+  0.50, 0.46, 0.42, 0.39, 0.36, 0.33, 0.30, 0.27, 0.25, 0.235, 0.22, 0.18, 0.15
+)
 N_ROWS = len(ROW_CLEARANCES)
 
 
