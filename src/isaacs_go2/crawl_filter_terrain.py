@@ -91,16 +91,19 @@ class CrawlFilterTerrainCfg(SubTerrainCfg):
     # Ground continues under the bar (crawling surface, tan).
     _add_box(body, geoms, pos=(x0 + BAR_DEPTH / 2, tw / 2, 0.0),
              size=(BAR_DEPTH / 2, tw / 2, 0.01), rgba=(0.72, 0.62, 0.45, 1.0))
-    # Beam at the clearance height (red; darker when impossible).
-    beam_rgba = (0.55, 0.05, 0.05, 1.0) if impossible else (0.85, 0.15, 0.15, 1.0)
+    # Beam at the clearance height (red; darker when impossible). Semi-
+    # transparent so the robot is visible THROUGH the bar structure in videos
+    # (a solid wall occludes it from every non-opening angle).
+    beam_rgba = (0.55, 0.05, 0.05, 0.65) if impossible else (0.85, 0.15, 0.15, 0.6)
     _add_box(body, geoms,
              pos=(x0 + BAR_DEPTH / 2, tw / 2, clearance + BEAM_THICKNESS / 2),
              size=(BAR_DEPTH / 2, tw / 2, BEAM_THICKNESS / 2), rgba=beam_rgba)
-    # Anti-jump wall above the beam.
+    # Anti-jump wall above the beam (mostly transparent — its only job is to
+    # rule out jumping over, it should not hide the robot).
     wall_z = clearance + BEAM_THICKNESS + WALL_HEIGHT / 2
     _add_box(body, geoms, pos=(x0 + BAR_DEPTH / 2, tw / 2, wall_z),
              size=(BAR_DEPTH / 2, tw / 2, WALL_HEIGHT / 2),
-             rgba=(0.35, 0.35, 0.4, 1.0))
+             rgba=(0.35, 0.35, 0.4, 0.25))
     # Side pillars (full height of beam+wall).
     pillar_h = clearance + BEAM_THICKNESS + WALL_HEIGHT
     for y in (PILLAR_WIDTH, tw - PILLAR_WIDTH):

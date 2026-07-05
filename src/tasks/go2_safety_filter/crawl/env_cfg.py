@@ -168,6 +168,17 @@ def unitree_go2_crawl_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.scene.terrain.max_init_terrain_level = 0
   cfg.episode_length_s = 6.0
 
+  # Side-profile follow camera (azimuth 90 = robot moving L->R into the bar on
+  # the right): the crouch depth is directly legible in profile. The bar spans
+  # the full width, so a side view looks THROUGH it when the robot is under —
+  # only works because the beam/wall are now semi-transparent (verified: robot
+  # stays fully visible under the bar). A rear view (azimuth 180) renders the
+  # robot off-frame; azimuth 0/90/270 all show it, 90 gives natural motion.
+  cfg.viewer.body_name = "base_link"
+  cfg.viewer.distance = 3.3
+  cfg.viewer.elevation = -14.0
+  cfg.viewer.azimuth = 90.0
+
   _add_bar_perception(cfg)
 
   # Ground approach spawn with forward momentum (no midair gap reset).

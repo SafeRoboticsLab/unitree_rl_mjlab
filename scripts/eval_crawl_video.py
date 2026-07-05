@@ -62,10 +62,13 @@ def record(name, row, spawn, ckpt, args):
   env_cfg = load_env_cfg(TASK, play=True)
   env_cfg.scene.num_envs = args.num_envs
   env_cfg.curriculum = {}
-  # Side-on follow camera: bar, colored zones, and body height all legible.
-  env_cfg.viewer.distance = 3.6
-  env_cfg.viewer.elevation = -18.0
-  env_cfg.viewer.azimuth = 105.0
+  # Side-profile follow camera (azimuth 90, robot moving L->R into the bar):
+  # crouch depth is directly legible; the semi-transparent beam/wall keeps the
+  # robot visible even when it is directly under the bar.
+  env_cfg.viewer.body_name = "base_link"
+  env_cfg.viewer.distance = 3.3
+  env_cfg.viewer.elevation = -14.0
+  env_cfg.viewer.azimuth = 90.0
   agent_cfg = load_rl_cfg(TASK)
 
   env = ManagerBasedRlEnv(cfg=env_cfg, device=args.device, render_mode="rgb_array")
