@@ -93,12 +93,21 @@ def main():
     from stable_baselines3.common.vec_env import VecNormalize
     vn_path = args.load.replace("final_model.zip", "vecnormalize.pkl")
     if os.path.exists(vn_path):
+      inner = env  # the (possibly higher-dim-action) env to warm-start onto
       env = VecNormalize.load(vn_path, env)
       env.training = True
+      # VecNormalize.load restores the SAVED spaces; when warm-starting the
+      # 15-dim adversary (ctrl+dstb) from a 12-dim single-agent checkpoint the
+      # action space must stay the new env's (only obs stats transfer).
+      env.action_space = inner.action_space
+      env.observation_space = inner.observation_space
       common = {k: v for k, v in common.items() if k != "normalize_obs"}
     model = Algo("MlpPolicy", env, **akw, **common)
-    model.set_parameters(args.load, device=args.device)
-    print(f"[warm-start] loaded {args.load}")
+    # exact_match=False so IsaacsPPO warm-starts ONLY its ctrl player
+    # (self.policy) from a single-agent chain checkpoint; the dstb player and
+    # leaderboard stay fresh (the rsl_rl ISAACS ctrl-from-model_28799 pattern).
+    model.set_parameters(args.load, exact_match=False, device=args.device)
+    print(f"[warm-start] loaded {args.load} (ctrl policy)")
   else:
     model = Algo("MlpPolicy", env, **akw, **common)
 
