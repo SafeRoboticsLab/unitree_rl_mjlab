@@ -17,3 +17,4 @@ slurm_outs
 *.slurm
 runs
 datasets
+runs_sb3/
