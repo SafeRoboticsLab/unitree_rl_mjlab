@@ -132,10 +132,18 @@ def reset_takeover_crawl(env, env_ids, asset_cfg=SceneEntityCfg("robot"),
   if ev is not None:
     env._was_mustcrawl[env_ids] = False
     env._handover_mask[env_ids] = False
-    env._crouch_mask[env_ids] = False
+    crouch = bool(ev.get("crouch", False))
+    alpha = float(ev.get("crouch_alpha", 0.0))
+    env._crouch_mask[env_ids] = crouch
+    env._crouch_alpha[env_ids] = alpha
     positions = root[:, 0:3] + env.scene.env_origins[env_ids]
-    positions[:, 0] += _BAR_X - _NOSE - float(ev["d"])
-    positions[:, 2] += 0.02
+    positions[:, 0] += _BAR_X - _NOSE - float(ev["d"])   # d < 0 spawns past bar
+    if crouch:
+      # Equilibrium-matched crouch height (see reset strata).
+      positions[:, 2] = (env.scene.env_origins[env_ids][:, 2]
+                         + 0.166 - 0.02 * alpha + 0.02)
+    else:
+      positions[:, 2] += 0.02
     velocities = root[:, 7:13].clone()
     velocities[:] = 0.0
     velocities[:, 0] = float(ev["v"])
