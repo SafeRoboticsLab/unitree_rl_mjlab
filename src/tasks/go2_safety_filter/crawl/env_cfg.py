@@ -57,17 +57,33 @@ _APPROACH_MIN = 0.3  # nose-distance to the bar face, near end
 _APPROACH_MAX = 2.2  # nose-distance to the bar face, far end (approach is 2.5)
 
 
-def reset_crawl_approach(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
-  """Spawn upright on the approach, facing the bar, with forward momentum.
+_FRAC_BEYOND = 0.35  # fraction spawned PAST the bar (far-side value seed)
 
-  Distance-to-bar and arrival speed are both varied so the value function sees
-  the full decision-relevant band (far/slow trivially safe -> close/fast
-  possibly doomed at low bars).  No crouch, no strata: the terrain height
-  curriculum, not the spawn, sets the difficulty."""
+
+def _ensure_crawl_buffers(env):
+  if not hasattr(env, "_crawl_started_before"):
+    env._crawl_started_before = torch.ones(
+      env.num_envs, dtype=torch.bool, device=env.device)
+
+
+def reset_crawl_approach(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
+  """Spawn upright facing the bar with forward momentum.
+
+  Two spawn bands:
+  * APPROACH (65%): nose-distance d in front of the bar face, varied
+    dist/speed so the value function sees the full decision band.
+  * BEYOND (35%): already PAST the bar exit (rest zone, always clear for an
+    upright robot at any bar height). This seeds the far side — without it a
+    fresh policy stops dead at the bar (it reads "beam ahead" and stopping is
+    safe; the approach l is already maxed so nothing pulls it through). With a
+    high-value "keep walking past the bar" region seeded, the reach-avoid
+    backup pulls the approach robots under and through. Beyond-spawns are
+    tagged so they don't spuriously promote the terrain curriculum."""
   if env_ids is None:
     env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
   if len(env_ids) == 0:
     return
+  _ensure_crawl_buffers(env)
   asset = env.scene[asset_cfg.name]
   device = env.device
   n = int(len(env_ids))
@@ -76,8 +92,13 @@ def reset_crawl_approach(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
   def u(lo, hi):
     return sample_uniform(lo, hi, (n,), device)
 
+  beyond = u(0.0, 1.0) < _FRAC_BEYOND
+  env._crawl_started_before[env_ids] = ~beyond
+
   d = u(_APPROACH_MIN, _APPROACH_MAX)                 # nose-distance to bar face
-  x = (_BAR_X - _NOSE - d).clamp(min=0.15)
+  x_approach = (_BAR_X - _NOSE - d).clamp(min=0.15)
+  x_beyond = (_BAR_X + BAR_DEPTH) + u(0.1, 2.5)       # rest zone, past exit
+  x = torch.where(beyond, x_beyond, x_approach)
   pose = torch.stack(
     [x, u(-0.06, 0.06), u(-0.02, 0.02),
      u(-0.05, 0.05), u(-0.05, 0.05), u(-0.06, 0.06)], dim=1)
@@ -105,14 +126,18 @@ def crawl_height_levels(env, env_ids) -> torch.Tensor | None:
   terrain = env.scene.terrain
   if terrain is None or not hasattr(terrain, "update_env_origins"):
     return None
+  _ensure_crawl_buffers(env)
   x_rel = (env.scene["robot"].data.root_link_pos_w[env_ids, 0]
            - env.scene.env_origins[env_ids, 0])
   # Guard the first reset (robot world position is stale/off-patch before the
   # reset event places it -> x_rel ~ inter-patch spacing): only trust readings
   # inside the 12 m patch.
   in_patch = (x_rel > -1.0) & (x_rel < 11.0)
-  move_up = in_patch & (x_rel > (_BAR_X + BAR_DEPTH + 1.0))
-  move_down = in_patch & (x_rel < (_BAR_X - 0.3))
+  # Promote ONLY envs that started before the bar and finished past it (beyond-
+  # spawns start past the bar and would promote spuriously).
+  started_before = env._crawl_started_before[env_ids]
+  move_up = in_patch & started_before & (x_rel > (_BAR_X + BAR_DEPTH + 1.0))
+  move_down = in_patch & started_before & (x_rel < (_BAR_X - 0.3))
   terrain.update_env_origins(env_ids, move_up, move_down & ~move_up)
   return terrain.terrain_levels.float().mean()
 
