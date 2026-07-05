@@ -28,6 +28,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
 sys.path.insert(0, "/home/buzi/Desktop/RESEARCH/SAFE/DEVELOPMENT/safety-stable-baselines")
 
+from stable_baselines3.common.callbacks import CheckpointCallback  # noqa: E402
 from stable_baselines3.common.vec_env import VecMonitor  # noqa: E402
 
 from safety_sb3 import IsaacsPPO, ReachAvoidPPO, SafetyPPO  # noqa: E402
@@ -101,7 +102,12 @@ def main():
   else:
     model = Algo("MlpPolicy", env, **akw, **common)
 
-  model.learn(total_timesteps=args.steps, progress_bar=False)
+  # Periodic checkpoints (+ VecNormalize) so runs are evaluable mid-training.
+  ckpt_cb = CheckpointCallback(
+    save_freq=max(1, 2_000_000 // args.num_envs),
+    save_path=os.path.join(_REPO, "runs_sb3", tag, "checkpoints"),
+    name_prefix="model", save_vecnormalize=True)
+  model.learn(total_timesteps=args.steps, progress_bar=False, callback=ckpt_cb)
   outdir = os.path.join(_REPO, "runs_sb3", tag)
   model.save(os.path.join(outdir, "final_model.zip"))
   vn = model.get_vec_normalize_env()
