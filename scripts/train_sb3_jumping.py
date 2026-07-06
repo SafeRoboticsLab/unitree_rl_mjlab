@@ -83,6 +83,8 @@ def main():
   p.add_argument("--load", default=None, help="warm-start checkpoint (.zip)")
   p.add_argument("--device", default="cuda:0")
   p.add_argument("--tag", default=None)
+  p.add_argument("--wandb-project", default="safety_sb3_gap")
+  p.add_argument("--no-wandb", action="store_true")
   args = p.parse_args()
 
   tag = args.tag or f"sb3_{args.stage}{'_isaacs' if args.adversary else ''}"
@@ -153,8 +155,20 @@ def main():
   if args.stage == "chain" and args.adversary:
     # force ramp to force_max over ~55% of training, then hold.
     cbs.append(ForceRampCallback(args.force_max, int(0.55 * args.steps)))
+
+  wb_run = None
+  if not args.no_wandb:
+    import wandb
+    from wandb.integration.sb3 import WandbCallback
+    wb_run = wandb.init(project=args.wandb_project, name=tag,
+                        config=vars(args), sync_tensorboard=True,
+                        save_code=False, reinit=True)
+    cbs.append(WandbCallback(verbose=0))
+
   model.learn(total_timesteps=args.steps, progress_bar=False,
               callback=CallbackList(cbs))
+  if wb_run is not None:
+    wb_run.finish()
   outdir = os.path.join(_REPO, "runs_sb3", tag)
   model.save(os.path.join(outdir, "final_model.zip"))
   vn = model.get_vec_normalize_env()
