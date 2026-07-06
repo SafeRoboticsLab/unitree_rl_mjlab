@@ -57,6 +57,42 @@ class ForceRampCallback(BaseCallback):
     self._bridge.force_max = self.fstart + (self.fmax - self.fstart) * frac
     return True
 
+
+class VideoWandbCallback(BaseCallback):
+  """Periodically roll out the current (deterministic) policy in a small
+  render env and upload the clip to wandb as eval/video -- mirrors the rsl_rl
+  train/video behavior so every run has watchable eval footage."""
+
+  def __init__(self, eval_env_fn, interval, video_len=200):
+    super().__init__()
+    self.eval_env_fn, self.interval, self.video_len = eval_env_fn, interval, video_len
+    self._env = None
+    self._last = 0
+
+  def _on_training_start(self):
+    self._env = self.eval_env_fn()  # raw bridge, adversary off, render on
+
+  def _on_step(self):
+    if self.num_timesteps - self._last >= self.interval:
+      self._last = self.num_timesteps
+      self._log_video()
+    return True
+
+  def _log_video(self):
+    import numpy as np
+    import wandb
+    vn = self.model.get_vec_normalize_env()
+    obs = self._env.reset()
+    frames = []
+    for _ in range(self.video_len):
+      o = vn.normalize_obs(obs) if vn is not None else obs
+      act, _ = self.model.predict(o, deterministic=True)
+      obs, _r, _d, _i = self._env.step(act)
+      frames.append(np.asarray(self._env.render()))
+    vid = np.stack(frames).transpose(0, 3, 1, 2)  # (T, C, H, W) uint8
+    wandb.log({"eval/video": wandb.Video(vid, fps=30, format="mp4")},
+              step=self.num_timesteps)
+
 from safety_sb3 import IsaacsPPO, ReachAvoidPPO, SafetyPPO  # noqa: E402
 from src.isaacs_go2.go2_parkour_isaacs import (  # noqa: E402
   CTRL_DIM,
@@ -164,6 +200,15 @@ def main():
                         config=vars(args), sync_tensorboard=True,
                         save_code=False, reinit=True)
     cbs.append(WandbCallback(verbose=0))
+    # eval-video env: small, render on, adversary OFF (show the ctrl policy).
+    if args.stage == "chain":
+      eval_fn = lambda: make_chain_vecenv(2, args.device, adversary=False,
+                                          render_mode="rgb_array")
+    elif args.stage == "landing":
+      eval_fn = lambda: make_landing_vecenv(2, args.device, render_mode="rgb_array")
+    else:
+      eval_fn = lambda: make_crossing_vecenv(2, args.device, render_mode="rgb_array")
+    cbs.append(VideoWandbCallback(eval_fn, interval=max(1, args.steps // 8)))
 
   model.learn(total_timesteps=args.steps, progress_bar=False,
               callback=CallbackList(cbs))
