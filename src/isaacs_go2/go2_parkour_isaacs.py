@@ -109,15 +109,9 @@ def parkour_gap_margins(env):
   return g.clamp(-3.0, 3.0), l.clamp(-3.0, 3.0)
 
 
-def parkour_isaacs_hook(env, margin_fn=None) -> torch.Tensor:
-  """Pre-reset reward-term hook: stash terminal-correct g/l in env.extras.
-
-  ``margin_fn(env) -> (g, l)`` selects the task's reach-avoid margins
-  (default: the gap foothold+progress margins). g is anchored to the terminal
-  failure value on real terminations, matching the rsl_rl wrapper."""
-  if margin_fn is None:
-    margin_fn = parkour_gap_margins
-  g, l = margin_fn(env)
+def parkour_isaacs_hook(env) -> torch.Tensor:
+  """Pre-reset reward-term hook: stash terminal-correct g/l in env.extras."""
+  g, l = parkour_gap_margins(env)
   failed = env.termination_manager.terminated
   g = torch.where(failed, torch.minimum(g, torch.full_like(g, TERMINAL_MARGIN)), g)
   env.extras["isaacs_g"] = g
@@ -125,18 +119,12 @@ def parkour_isaacs_hook(env, margin_fn=None) -> torch.Tensor:
   return g
 
 
-def _build_parkour_cfg(num_envs: int, cfg_builder=None, margin_fn=None):
-  """Build an mjlab env cfg for the SB3 bridge: any go2_safety_filter cfg
-  builder + the isaacs g/l reward hook (the env logic — spawn strata, reverse
-  curricula, handover — is algorithm-agnostic and reused as-is)."""
-  if cfg_builder is None:
-    cfg_builder = unitree_go2_gap_reach_avoid_env_cfg
-  cfg = cfg_builder(play=False)
+def _build_parkour_cfg(num_envs: int):
+  cfg = unitree_go2_gap_reach_avoid_env_cfg(play=False)
   cfg.scene.num_envs = int(num_envs)
   if cfg.events is not None:
     cfg.events.pop("push_robot", None)  # learned force adversary replaces it
-  cfg.rewards["isaacs_safety_hook"] = RewardTermCfg(
-    func=parkour_isaacs_hook, weight=1.0, params={"margin_fn": margin_fn})
+  cfg.rewards["isaacs_safety_hook"] = RewardTermCfg(func=parkour_isaacs_hook, weight=1.0, params={})
   return cfg
 
 
@@ -153,8 +141,7 @@ class Go2ParkourIsaacsVecEnv(VecEnv, _ForceMixin):
   """Parallel SB3 VecEnv over the mjlab Go2 gap reach-avoid env + force adversary."""
 
   def __init__(self, num_envs=64, device="cuda:0", render_mode=None, *,
-               ctrl_gain=3.0, force_max=50.0, adversary=True,
-               cfg_builder=None, margin_fn=None):
+               ctrl_gain=3.0, force_max=50.0, adversary=True):
     self._device = device
     self.render_mode = render_mode
     self.ctrl_gain = float(ctrl_gain)
@@ -162,8 +149,7 @@ class Go2ParkourIsaacsVecEnv(VecEnv, _ForceMixin):
     self.adversary = bool(adversary)
 
     self.mj = ManagerBasedRlEnv(
-      cfg=_build_parkour_cfg(num_envs, cfg_builder=cfg_builder, margin_fn=margin_fn),
-      device=device,
+      cfg=_build_parkour_cfg(num_envs), device=device,
       render_mode="rgb_array" if render_mode else None,
     )
     self._robot = self.mj.scene["robot"]
@@ -175,11 +161,7 @@ class Go2ParkourIsaacsVecEnv(VecEnv, _ForceMixin):
     obs_dict, _ = self.mj.reset()
     obs0 = self._obs(obs_dict)
     obs_space = spaces.Box(-np.inf, np.inf, shape=(obs0.shape[1],), dtype=np.float32)
-    # Single-agent (adversary off) exposes a ctrl-only action space; the
-    # two-player ISAACS action appends the DSTB force dims. step_wait reads
-    # a[:, :CTRL_DIM] for ctrl and only touches a[:, CTRL_DIM:] when adversary.
-    act_dim = CTRL_DIM + (DSTB_DIM if self.adversary else 0)
-    act_space = spaces.Box(-1.0, 1.0, shape=(act_dim,), dtype=np.float32)
+    act_space = spaces.Box(-1.0, 1.0, shape=(CTRL_DIM + DSTB_DIM,), dtype=np.float32)
     super().__init__(int(num_envs), obs_space, act_space)
     self._actions = None
 
@@ -320,171 +302,3 @@ class Go2ParkourIsaacsEnv(gym.Env, _ForceMixin):
       self.mj.close()
     except Exception:
       pass
-
-
-# ---------------------------------------------------------------------------
-# Separate SB3 VecEnv factories for the jumping pipeline (landing -> crossing ->
-# chain), mirroring the rsl_rl task structure. The mjlab env cfgs carry the
-# spawn strata + reverse curricula + handover; the bridge only swaps the cfg
-# and (for the rest objective) the l margin. Avoid-only stages (landing,
-# crossing) train with safety_sb3 SafetyPPO and ignore l; the chain stage uses
-# ReachAvoidPPO with rest_margins.
-# ---------------------------------------------------------------------------
-
-def rest_margins(env):
-  """Reach-avoid margins for the REST objective (crossing-chain): same g as the
-  gap task; l = come to a safe stop + mild forward-progress cross bias
-  (mirrors ParkourReachAvoidVecEnvWrapper rest mode: v_rest 0.3, norm 0.5,
-  cross_bias 0.3, scale 3.0)."""
-  g, _ = parkour_gap_margins(env)
-  robot = env.scene["robot"]
-  speed = torch.norm(robot.data.root_link_lin_vel_w[:, :2], dim=1)
-  l_rest = (0.3 - speed) / 0.5
-  origin_x = env.scene.env_origins[:, 0]
-  prog = ((robot.data.root_link_pos_w[:, 0] - origin_x) / 3.0).clamp(0.0, 1.0)
-  l = l_rest + 0.3 * prog
-  return g.clamp(-3.0, 3.0), l.clamp(-3.0, 3.0)
-
-
-def make_landing_vecenv(num_envs=1024, device="cuda:0", **kw):
-  """Avoid-only landing (mid-air-over-gap spawn -> soft land). SafetyPPO."""
-  from src.tasks.go2_safety_filter.landing.env_cfg import (
-    unitree_go2_landing_env_cfg,
-  )
-  return Go2ParkourIsaacsVecEnv(
-    num_envs=num_envs, device=device, adversary=False,
-    cfg_builder=unitree_go2_landing_env_cfg, **kw)
-
-
-def make_crossing_vecenv(num_envs=1024, device="cuda:0", **kw):
-  """Avoid-only reverse-curriculum crossing (launch->land). SafetyPPO."""
-  from src.tasks.go2_safety_filter.crossing.env_cfg import (
-    unitree_go2_crossing_env_cfg,
-  )
-  return Go2ParkourIsaacsVecEnv(
-    num_envs=num_envs, device=device, adversary=False,
-    cfg_builder=unitree_go2_crossing_env_cfg, **kw)
-
-
-def make_chain_vecenv(num_envs=1024, device="cuda:0", adversary=False, **kw):
-  """Rest-objective crossing-chain (arrival momentum -> safe rest). ReachAvoid/
-  IsaacsPPO (adversary=True for the two-player game).
-
-  The adversary case uses the PINNED-curricula isaacs cfg (edge_margin 0.3 +
-  pinned_levels): under adversarial pressure the survival-gated curricula
-  otherwise demote and the game spirals into a treadmill / ctrl collapse
-  (observed on the base cfg: ep_len 192 -> 20). Pair with a force-magnitude
-  ramp (train-side) so the adversary strengthens gradually."""
-  if adversary:
-    from src.tasks.go2_safety_filter.crossing_chain.env_cfg import (
-      unitree_go2_crossing_chain_isaacs_env_cfg as cfg_builder,
-    )
-  else:
-    from src.tasks.go2_safety_filter.crossing_chain.env_cfg import (
-      unitree_go2_crossing_chain_env_cfg as cfg_builder,
-    )
-  return Go2ParkourIsaacsVecEnv(
-    num_envs=num_envs, device=device, adversary=adversary,
-    cfg_builder=cfg_builder, margin_fn=rest_margins, **kw)
-
-
-# ---------------------------------------------------------------------------
-# GPU-resident bridge (safety_sb3 TensorVecEnv): torch end-to-end, no numpy
-# bounce. Same cfg builders + margin hook as the numpy bridge; additionally
-# forwards mjlab extras["log"] scalars (curriculum levels, task metrics) via
-# metrics() so the algorithm logs them every rollout.
-# ---------------------------------------------------------------------------
-
-def _tensor_bridge_cls():
-  from safety_sb3.tensor_env import TensorVecEnv
-
-  class Go2ParkourTensorVecEnv(TensorVecEnv):
-    def __init__(self, num_envs=1024, device="cuda:0", *, ctrl_gain=3.0,
-                 force_max=50.0, adversary=False, cfg_builder=None,
-                 margin_fn=None, render_mode=None):
-      self.ctrl_gain = float(ctrl_gain)
-      self.force_max = float(force_max)
-      self.adversary = bool(adversary)
-      self.render_mode = render_mode
-      self.mj = ManagerBasedRlEnv(
-        cfg=_build_parkour_cfg(num_envs, cfg_builder=cfg_builder, margin_fn=margin_fn),
-        device=device, render_mode="rgb_array" if render_mode else None)
-      self._robot = self.mj.scene["robot"]
-      body_ids, _ = self._robot.find_bodies("base_link")
-      self._base_body_ids = list(body_ids)
-      self._all_ids = torch.arange(int(num_envs), device=device)
-      self._zero_wrench = torch.zeros((int(num_envs), 1, 3), device=device)
-      self._log: dict = {}
-      obs_dict, _ = self.mj.reset()
-      obs0 = obs_dict["proprioception"]
-      obs_space = spaces.Box(-np.inf, np.inf, shape=(int(obs0.shape[1]),), dtype=np.float32)
-      act_dim = CTRL_DIM + (DSTB_DIM if self.adversary else 0)
-      act_space = spaces.Box(-1.0, 1.0, shape=(act_dim,), dtype=np.float32)
-      super().__init__(int(num_envs), obs_space, act_space, device)
-
-    def reset(self):
-      obs_dict, _ = self.mj.reset()
-      return obs_dict["proprioception"].float()
-
-    def step_tensor(self, actions):
-      if self.adversary:
-        a = actions[:, CTRL_DIM:]
-        unit = a / a.norm(dim=1, keepdim=True).clamp_min(1e-6)
-        forces = (unit * self.force_max).reshape(self.num_envs, 1, 3)
-        self._robot.write_external_wrench_to_sim(
-          forces, self._zero_wrench, body_ids=self._base_body_ids,
-          env_ids=self._all_ids)
-      ctrl = actions[:, :CTRL_DIM] * self.ctrl_gain
-      obs_dict, _r, terminated, truncated, extras = self.mj.step(ctrl)
-      g = extras["isaacs_g"].float()
-      l = extras["isaacs_l"].float()
-      dones = (terminated | truncated)
-      timeouts = truncated & ~terminated
-      log = extras.get("log", {})
-      if log:
-        for k, v in log.items():
-          try:
-            self._log[k] = float(v)
-          except (TypeError, ValueError):
-            pass
-      return obs_dict["proprioception"].float(), g, dones, timeouts, l
-
-    def metrics(self):
-      out, self._log = self._log, {}
-      return out
-
-    def render(self):
-      return self.mj.render()
-
-    def close(self):
-      try:
-        self.mj.close()
-      except Exception:
-        pass
-
-  return Go2ParkourTensorVecEnv
-
-
-def make_landing_tensor_vecenv(num_envs=2048, device="cuda:0", **kw):
-  from src.tasks.go2_safety_filter.landing.env_cfg import unitree_go2_landing_env_cfg
-  return _tensor_bridge_cls()(num_envs, device, adversary=False,
-                              cfg_builder=unitree_go2_landing_env_cfg, **kw)
-
-
-def make_crossing_tensor_vecenv(num_envs=2048, device="cuda:0", **kw):
-  from src.tasks.go2_safety_filter.crossing.env_cfg import unitree_go2_crossing_env_cfg
-  return _tensor_bridge_cls()(num_envs, device, adversary=False,
-                              cfg_builder=unitree_go2_crossing_env_cfg, **kw)
-
-
-def make_chain_tensor_vecenv(num_envs=2048, device="cuda:0", adversary=False, **kw):
-  if adversary:
-    from src.tasks.go2_safety_filter.crossing_chain.env_cfg import (
-      unitree_go2_crossing_chain_isaacs_env_cfg as cb,
-    )
-  else:
-    from src.tasks.go2_safety_filter.crossing_chain.env_cfg import (
-      unitree_go2_crossing_chain_env_cfg as cb,
-    )
-  return _tensor_bridge_cls()(num_envs, device, adversary=adversary,
-                              cfg_builder=cb, margin_fn=rest_margins, **kw)
