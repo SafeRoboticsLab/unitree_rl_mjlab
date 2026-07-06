@@ -82,10 +82,16 @@ class VideoWandbCallback(BaseCallback):
     import numpy as np
     import wandb
     vn = self.model.get_vec_normalize_env()
+    tvn = self.model.env if hasattr(self.model.env, "normalize_obs_np") else None
     obs = self._env.reset()
     frames = []
     for _ in range(self.video_len):
-      o = vn.normalize_obs(obs) if vn is not None else obs
+      if vn is not None:
+        o = vn.normalize_obs(obs)
+      elif tvn is not None:
+        o = tvn.normalize_obs_np(obs)
+      else:
+        o = obs
       act, _ = self.model.predict(o, deterministic=True)
       obs, _r, _d, _i = self._env.step(act)
       frames.append(np.asarray(self._env.render()))
@@ -96,8 +102,11 @@ class VideoWandbCallback(BaseCallback):
 from safety_sb3 import IsaacsPPO, ReachAvoidPPO, SafetyPPO  # noqa: E402
 from src.isaacs_go2.go2_parkour_isaacs import (  # noqa: E402
   CTRL_DIM,
+  make_chain_tensor_vecenv,
   make_chain_vecenv,
+  make_crossing_tensor_vecenv,
   make_crossing_vecenv,
+  make_landing_tensor_vecenv,
   make_landing_vecenv,
 )
 
@@ -120,6 +129,7 @@ def main():
   p.add_argument("--device", default="cuda:0")
   p.add_argument("--tag", default=None)
   p.add_argument("--wandb-project", default="safety_sb3_gap")
+  p.add_argument("--no-tensor", action="store_true", help="use the numpy VecEnv path")
   p.add_argument("--no-wandb", action="store_true")
   args = p.parse_args()
 
@@ -135,15 +145,20 @@ def main():
                 policy_kwargs=policy_kwargs, verbose=1, device=args.device,
                 tensorboard_log=os.path.join(_REPO, "runs_sb3", tag))
 
+  # IsaacsPPO has no tensor collect loop yet -> numpy path for --adversary.
+  use_tensor = not args.no_tensor and not args.adversary
   if args.stage == "landing":
-    env = VecMonitor(make_landing_vecenv(args.num_envs, args.device))
+    env = (make_landing_tensor_vecenv(args.num_envs, args.device) if use_tensor
+           else VecMonitor(make_landing_vecenv(args.num_envs, args.device)))
     Algo, akw = SafetyPPO, {}
   elif args.stage == "crossing":
-    env = VecMonitor(make_crossing_vecenv(args.num_envs, args.device))
+    env = (make_crossing_tensor_vecenv(args.num_envs, args.device) if use_tensor
+           else VecMonitor(make_crossing_vecenv(args.num_envs, args.device)))
     Algo, akw = SafetyPPO, {}
   else:  # chain
-    env = VecMonitor(make_chain_vecenv(
-      args.num_envs, args.device, adversary=args.adversary, force_max=args.force_max))
+    env = (make_chain_tensor_vecenv(args.num_envs, args.device) if use_tensor
+           else VecMonitor(make_chain_vecenv(
+      args.num_envs, args.device, adversary=args.adversary, force_max=args.force_max)))
     if args.adversary:
       Algo = IsaacsPPO
       # Schedule is in ROLLOUTS (collect+update), NOT rsl_rl iterations. At
@@ -158,7 +173,31 @@ def main():
     else:
       Algo, akw = ReachAvoidPPO, {}
 
-  if args.load:
+  if args.load and use_tensor:
+    import pickle
+    import torch as th
+    model = Algo("MlpPolicy", env, **akw, **common)
+    model.set_parameters(args.load, exact_match=False, device=args.device)
+    tvn = model.env  # TensorVecNormalize (built by normalize_obs=True)
+    pt = args.load.replace("final_model.zip", "tensornormalize.pt")
+    pkl = args.load.replace("final_model.zip", "vecnormalize.pkl")
+    if os.path.exists(pt):
+      from safety_sb3 import TensorVecNormalize
+      state = th.load(pt, map_location=args.device, weights_only=True)
+      tvn.obs_mean = state["obs_mean"].to(tvn.device)
+      tvn.obs_var = state["obs_var"].to(tvn.device)
+      tvn.count = state["count"].to(tvn.device)
+      print(f"[warm-start] {args.load} + tensor obs stats")
+    elif os.path.exists(pkl):
+      with open(pkl, "rb") as f:
+        vn = pickle.load(f)
+      tvn.obs_mean = th.as_tensor(vn.obs_rms.mean, dtype=th.float32, device=tvn.device)
+      tvn.obs_var = th.as_tensor(vn.obs_rms.var, dtype=th.float32, device=tvn.device)
+      tvn.count = th.tensor(float(vn.obs_rms.count), device=tvn.device)
+      print(f"[warm-start] {args.load} + converted numpy VecNormalize stats")
+    else:
+      print(f"[warm-start] {args.load} (no obs stats found -- fresh normalizer)")
+  elif args.load:
     # Restore the prior stage's obs-normalization stats onto this env, then
     # load the policy (SB3 VecNormalize stats live outside the .zip).
     from stable_baselines3.common.vec_env import VecNormalize
@@ -219,7 +258,9 @@ def main():
   vn = model.get_vec_normalize_env()
   if vn is not None:
     vn.save(os.path.join(outdir, "vecnormalize.pkl"))
-  print(f"[done] saved {outdir}/final_model.zip (+ vecnormalize)")
+  if hasattr(model.env, "normalize_obs_np"):  # TensorVecNormalize
+    model.env.save(os.path.join(outdir, "tensornormalize.pt"))
+  print(f"[done] saved {outdir}/final_model.zip (+ normalizer stats)")
 
 
 if __name__ == "__main__":

@@ -386,3 +386,105 @@ def make_chain_vecenv(num_envs=1024, device="cuda:0", adversary=False, **kw):
   return Go2ParkourIsaacsVecEnv(
     num_envs=num_envs, device=device, adversary=adversary,
     cfg_builder=cfg_builder, margin_fn=rest_margins, **kw)
+
+
+# ---------------------------------------------------------------------------
+# GPU-resident bridge (safety_sb3 TensorVecEnv): torch end-to-end, no numpy
+# bounce. Same cfg builders + margin hook as the numpy bridge; additionally
+# forwards mjlab extras["log"] scalars (curriculum levels, task metrics) via
+# metrics() so the algorithm logs them every rollout.
+# ---------------------------------------------------------------------------
+
+def _tensor_bridge_cls():
+  from safety_sb3.tensor_env import TensorVecEnv
+
+  class Go2ParkourTensorVecEnv(TensorVecEnv):
+    def __init__(self, num_envs=1024, device="cuda:0", *, ctrl_gain=3.0,
+                 force_max=50.0, adversary=False, cfg_builder=None,
+                 margin_fn=None, render_mode=None):
+      self.ctrl_gain = float(ctrl_gain)
+      self.force_max = float(force_max)
+      self.adversary = bool(adversary)
+      self.render_mode = render_mode
+      self.mj = ManagerBasedRlEnv(
+        cfg=_build_parkour_cfg(num_envs, cfg_builder=cfg_builder, margin_fn=margin_fn),
+        device=device, render_mode="rgb_array" if render_mode else None)
+      self._robot = self.mj.scene["robot"]
+      body_ids, _ = self._robot.find_bodies("base_link")
+      self._base_body_ids = list(body_ids)
+      self._all_ids = torch.arange(int(num_envs), device=device)
+      self._zero_wrench = torch.zeros((int(num_envs), 1, 3), device=device)
+      self._log: dict = {}
+      obs_dict, _ = self.mj.reset()
+      obs0 = obs_dict["proprioception"]
+      obs_space = spaces.Box(-np.inf, np.inf, shape=(int(obs0.shape[1]),), dtype=np.float32)
+      act_dim = CTRL_DIM + (DSTB_DIM if self.adversary else 0)
+      act_space = spaces.Box(-1.0, 1.0, shape=(act_dim,), dtype=np.float32)
+      super().__init__(int(num_envs), obs_space, act_space, device)
+
+    def reset(self):
+      obs_dict, _ = self.mj.reset()
+      return obs_dict["proprioception"].float()
+
+    def step_tensor(self, actions):
+      if self.adversary:
+        a = actions[:, CTRL_DIM:]
+        unit = a / a.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        forces = (unit * self.force_max).reshape(self.num_envs, 1, 3)
+        self._robot.write_external_wrench_to_sim(
+          forces, self._zero_wrench, body_ids=self._base_body_ids,
+          env_ids=self._all_ids)
+      ctrl = actions[:, :CTRL_DIM] * self.ctrl_gain
+      obs_dict, _r, terminated, truncated, extras = self.mj.step(ctrl)
+      g = extras["isaacs_g"].float()
+      l = extras["isaacs_l"].float()
+      dones = (terminated | truncated)
+      timeouts = truncated & ~terminated
+      log = extras.get("log", {})
+      if log:
+        for k, v in log.items():
+          try:
+            self._log[k] = float(v)
+          except (TypeError, ValueError):
+            pass
+      return obs_dict["proprioception"].float(), g, dones, timeouts, l
+
+    def metrics(self):
+      out, self._log = self._log, {}
+      return out
+
+    def render(self):
+      return self.mj.render()
+
+    def close(self):
+      try:
+        self.mj.close()
+      except Exception:
+        pass
+
+  return Go2ParkourTensorVecEnv
+
+
+def make_landing_tensor_vecenv(num_envs=2048, device="cuda:0", **kw):
+  from src.tasks.go2_safety_filter.landing.env_cfg import unitree_go2_landing_env_cfg
+  return _tensor_bridge_cls()(num_envs, device, adversary=False,
+                              cfg_builder=unitree_go2_landing_env_cfg, **kw)
+
+
+def make_crossing_tensor_vecenv(num_envs=2048, device="cuda:0", **kw):
+  from src.tasks.go2_safety_filter.crossing.env_cfg import unitree_go2_crossing_env_cfg
+  return _tensor_bridge_cls()(num_envs, device, adversary=False,
+                              cfg_builder=unitree_go2_crossing_env_cfg, **kw)
+
+
+def make_chain_tensor_vecenv(num_envs=2048, device="cuda:0", adversary=False, **kw):
+  if adversary:
+    from src.tasks.go2_safety_filter.crossing_chain.env_cfg import (
+      unitree_go2_crossing_chain_isaacs_env_cfg as cb,
+    )
+  else:
+    from src.tasks.go2_safety_filter.crossing_chain.env_cfg import (
+      unitree_go2_crossing_chain_env_cfg as cb,
+    )
+  return _tensor_bridge_cls()(num_envs, device, adversary=adversary,
+                              cfg_builder=cb, margin_fn=rest_margins, **kw)
